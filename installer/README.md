@@ -1,11 +1,94 @@
-# BKPI installer
+# BKPI
 
-Node 22+ is required, Rust is not. The npm package is prepared but not published.
-Package name lives in `package.json.name`; rename it there if `bkpi` is unavailable.
-Set `package.json.bkpi.releaseRepository` before publication, or use
-`BKPI_RELEASE_REPOSITORY=owner/repo`. No repository owner is guessed.
+Local installer for the BKPI Rust runtime and coding-agent integrations.
 
-Local development:
+**KPI + plan + Bitrix data → agent assessment → deterministic calculation in Rust.**
+
+Requires Node.js 22+. Rust is not required on the user's machine.
+
+## Install
+
+```sh
+npx bkpi
+```
+
+The installer downloads the native BKPI runtime for the current platform from the GitHub Release, verifies its SHA256 checksum and guides you through Bitrix24 and agent setup.
+
+Supported platforms:
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x64
+- Linux ARM64
+- Windows x64
+
+Useful commands:
+
+```sh
+npx bkpi doctor
+npx bkpi targets
+npx bkpi@latest update
+npx bkpi uninstall
+```
+
+## Setup
+
+The setup wizard can:
+
+- add or update Bitrix24 integrations;
+- choose local file, OS keychain or environment-variable credential storage;
+- configure Codex and/or Claude Code;
+- install the shared BKPI skill and MCP registration.
+
+Webhook input is masked and passed to the native runtime through stdin. Credentials are not placed in shell argv.
+
+The default credential backend is a private local file outside the workspace. OS keychain and environment variables are explicit alternatives.
+
+## Workspace
+
+Run initialization inside the project where you want to use BKPI:
+
+```sh
+bkpi init
+```
+
+Choose the integration, people and optional KPI documents. Then open a new Codex or Claude Code session in that project and ask the agent to analyze the KPI.
+
+Examples:
+
+```text
+Посмотри, как у меня идёт KPI за сентябрь.
+Разбери KPI Ивана подробно.
+По каким KPI у команды не хватает evidence?
+```
+
+## Updating
+
+`update` installs the runtime matching the version of the npm installer that launched it.
+
+To upgrade to the newest release:
+
+```sh
+npx bkpi@latest update
+```
+
+Then refresh agent integrations if needed:
+
+```sh
+npx bkpi@latest targets
+```
+
+## Agent targets
+
+BKPI supports Codex and Claude Code through their official CLIs.
+
+```sh
+npx bkpi targets
+```
+
+The installer registers the BKPI MCP server and installs the shared skill. Existing unrelated agent configuration is preserved.
+
+## Development
 
 ```sh
 npm ci
@@ -13,43 +96,26 @@ npm run typecheck
 npm run lint
 npm run build
 npm test
-BKPI_RUNTIME_SOURCE=/absolute/path/to/bkpi node dist/index.js update
-node dist/index.js setup
-npm pack
-npx --yes --package ./bkpi-0.6.0.tgz bkpi --help
+npm pack --dry-run
 ```
 
-`BKPI_INSTALL_DIR` overrides the user-local installation directory for isolated tests.
-`BKPI_RUNTIME_SOURCE` explicitly supplies a locally built binary instead of a release download.
-It must report the same version as this package. Never use this override with an untrusted binary.
+For local installer testing with a locally built runtime:
 
-Commands: `setup`, `doctor`, `update`, `uninstall`, `targets`, `init`,
-`integration list/add/remove/doctor`, `config migrate`, `person kpi set/show`.
-`update` installs the runtime matching this installer version; to upgrade releases use
-`npx bkpi@latest update` once published. Then run `targets` to refresh shared agent skills.
-No postinstall hook downloads or executes anything.
+```sh
+BKPI_RUNTIME_SOURCE=/absolute/path/to/bkpi node dist/index.js update
+```
 
-The wizard defaults to Private local file, with OS secure store and environment variables as explicit alternatives. It reads the webhook with a masked prompt and passes it to the Rust runtime through stdin only. Credential operations capture both output streams: failure details are suppressed, and successful output is redacted. The direct Rust CLI also supports masked input. Unix credential files use 0600; Windows uses user-directory ACLs. Environment setup asks only for origin and variable name and reports pending availability honestly.
+`BKPI_INSTALL_DIR` can be used to isolate the runtime installation directory during tests.
 
-Updates preserve the existing backend. Choose Change credential storage to run a verified move. Environment moves require a present variable and explicit confirmation; the previous secret is retained for recovery. See the root README for paths, permission repair and migration commands.
+## Security
 
-Codex and Claude adapters use their installed official CLIs. If a target CLI is absent,
-install it first or choose CLI only. Existing unrelated config is preserved. Unmanaged
-`bkpi` skill/MCP conflicts are reported, not overwritten. Managed targets can be removed.
-Uninstall retains credentials and all workspace data; remove integrations separately.
+- release binaries are verified with SHA256 before installation;
+- webhook values are not passed through argv;
+- credentials live outside the workspace;
+- Unix credential files use private permissions;
+- local state writes are atomic;
+- installer failures redact credential material from captured output.
 
-`npm run build` generates Codex and Claude plugin bundles from `../agent/skill` under
-`bundles/`. The default installer uses standalone skills plus user MCP registration;
-these work across projects and use an absolute runtime executable. Plugin bundles are
-an alternative distribution form and require `bkpi` on PATH. Do not install both forms
-at once, as the same skill/server may appear twice.
+## License
 
-The command runner uses [cross-spawn](https://github.com/moxystudio/node-cross-spawn)
-for Windows npm command shims and argument escaping. Credentials never enter shell argv.
-
-Setup asks for a hidden webhook and optional display name; the runtime generates
-an internal ID. Updating a webhook is a separate named integration selection.
-Run `init` in your project: choose people, supply optional KPI paths, and accept
-copying (default Yes) or retain a reference. New documents are visible at `KPI.md`
-or `kpi/<person-slug>.md`. The final summary prints absolute paths and chat fallback
-instructions. Existing hidden KPI references remain supported.
+MIT
