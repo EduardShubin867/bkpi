@@ -26,21 +26,38 @@ fn file() -> CredentialRef {
 #[test]
 fn file_crud_atomic_replacement_and_config_reference() {
     let dir = TempDir::new().unwrap();
+
     let store = SystemStore {
         root: dir.path().into(),
     };
+
     let reference = store
         .set("bitrix-portal", &Secret::new(WEBHOOK.into()), Backend::File)
         .unwrap();
+
     assert!(store.exists(&reference));
+
     config(reference.clone()).save_at(dir.path()).unwrap();
+
     assert!(
         !fs::read_to_string(dir.path().join("config.toml"))
             .unwrap()
             .contains("fixture-token")
     );
+
     let path = store.file(reference.account()).unwrap();
+
+    // Unix allows us to keep the old inode open while atomically replacing
+    // the path. Windows does not guarantee the same replace-over-open-handle
+    // semantics, so this part of the atomicity test is Unix-only.
+    #[cfg(unix)]
     let mut old = fs::File::open(&path).unwrap();
+
+    // On Windows verify the original credential before replacement without
+    // retaining an open handle to the destination.
+    #[cfg(windows)]
+    assert_eq!(fs::read_to_string(&path).unwrap(), WEBHOOK);
+
     store
         .set(
             reference.account(),
@@ -48,14 +65,25 @@ fn file_crud_atomic_replacement_and_config_reference() {
             Backend::File,
         )
         .unwrap();
-    let mut previous = String::new();
-    use std::io::Read;
-    old.read_to_string(&mut previous).unwrap();
-    assert_eq!(previous, WEBHOOK); // Old open file stays whole across rename.
+
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+
+        let mut previous = String::new();
+        old.read_to_string(&mut previous).unwrap();
+
+        // The already-open Unix file still refers to the complete old inode.
+        assert_eq!(previous, WEBHOOK);
+    }
+
     assert_eq!(store.load(&reference).unwrap().expose(), "replacement");
+
     assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
     store.remove(&reference).unwrap();
     store.remove(&reference).unwrap();
+
     assert!(!store.exists(&reference));
 }
 #[cfg(unix)]
