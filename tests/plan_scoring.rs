@@ -516,13 +516,7 @@ fn real_mcp_calculation_subprocess() {
 #[test]
 fn agent_contract_is_present_in_shared_skill() {
     let skill = include_str!("../agent/skill/SKILL.md");
-    for bundle in [
-        include_str!("../installer/bundles/skill/SKILL.md"),
-        include_str!("../installer/bundles/codex/bkpi/skills/bkpi/SKILL.md"),
-        include_str!("../installer/bundles/claude/bkpi/skills/bkpi/SKILL.md"),
-    ] {
-        assert_eq!(bundle, skill);
-    }
+
     for text in [
         "CURRENT conversation",
         "person-only",

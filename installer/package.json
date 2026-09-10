@@ -1,6 +1,6 @@
 {
   "name": "bkpi",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Install the local BKPI Rust runtime and coding-agent integrations",
   "type": "module",
   "bin": {
