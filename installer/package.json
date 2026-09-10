@@ -35,6 +35,6 @@
     "typescript-eslint": "^8.0.0"
   },
   "bkpi": {
-    "releaseRepository": ""
+    "releaseRepository": "EduardShubin867/bkpi"
   }
 }
