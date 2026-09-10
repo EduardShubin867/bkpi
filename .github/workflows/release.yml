@@ -55,14 +55,6 @@ jobs:
       - name: Rust tests
         run: cargo test --all-features
 
-      - name: Build release binary
-        run: |
-          cargo build \
-            --release \
-            --locked \
-            --features standalone-ai \
-            --target ${{ matrix.target }}
-
       - name: Package binary and checksum
         shell: python
         env:
