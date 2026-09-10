@@ -9,7 +9,7 @@ Requires Node.js 22+. Rust is not required on the user's machine.
 ## Install
 
 ```sh
-npx bkpi
+npx @eduard-shubin/bkpi
 ```
 
 The installer downloads the native BKPI runtime for the current platform from the GitHub Release, verifies its SHA256 checksum and guides you through Bitrix24 and agent setup.
@@ -25,11 +25,13 @@ Supported platforms:
 Useful commands:
 
 ```sh
-npx bkpi doctor
-npx bkpi targets
-npx bkpi@latest update
-npx bkpi uninstall
+npx @eduard-shubin/bkpi doctor
+npx @eduard-shubin/bkpi targets
+npx @eduard-shubin/bkpi@latest update
+npx @eduard-shubin/bkpi uninstall
 ```
+
+After installation, the native runtime is available as the regular `bkpi` command.
 
 ## Setup
 
@@ -69,13 +71,13 @@ Examples:
 To upgrade to the newest release:
 
 ```sh
-npx bkpi@latest update
+npx @eduard-shubin/bkpi@latest update
 ```
 
 Then refresh agent integrations if needed:
 
 ```sh
-npx bkpi@latest targets
+npx @eduard-shubin/bkpi@latest targets
 ```
 
 ## Agent targets
@@ -83,7 +85,7 @@ npx bkpi@latest targets
 BKPI supports Codex and Claude Code through their official CLIs.
 
 ```sh
-npx bkpi targets
+npx @eduard-shubin/bkpi targets
 ```
 
 The installer registers the BKPI MCP server and installs the shared skill. Existing unrelated agent configuration is preserved.
