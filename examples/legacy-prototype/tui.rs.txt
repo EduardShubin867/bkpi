@@ -1,0 +1,716 @@
+use std::collections::HashMap;
+use std::io;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::{Local, Utc};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::{Frame, Terminal};
+
+use crate::ai::{self, AiAnalysis};
+use crate::bitrix::{BitrixClient, ChecklistProgress, Task, User};
+use crate::config::Config;
+use crate::kpi::{self, IndicatorStatus, KpiSummary, Period};
+use crate::output::{status_label, truncate};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Kpi,
+    Ai,
+    Tasks,
+    Help,
+}
+
+impl Tab {
+    fn index(self) -> usize {
+        match self {
+            Self::Kpi => 0,
+            Self::Ai => 1,
+            Self::Tasks => 2,
+            Self::Help => 3,
+        }
+    }
+}
+
+struct App {
+    config: Config,
+    user: User,
+    tasks: Vec<Task>,
+    checklists: HashMap<String, ChecklistProgress>,
+    period: Period,
+    summary: KpiSummary,
+    ai_analysis: Option<AiAnalysis>,
+    tab: Tab,
+    selected_task: usize,
+    status: String,
+}
+
+impl App {
+    async fn load(client: &BitrixClient, config: Config) -> Result<Self> {
+        let user = client.current_user().await?;
+        let tasks = client.tasks_for_user(&user.id).await?;
+        let checklists = client.checklist_progress_for_open_tasks(&tasks).await;
+        let period = Period::parse_or_current(None)?;
+        let summary = kpi::calculate(&tasks, &period, &config.kpi, &checklists);
+        let ai_analysis = ai::load_analysis(&period.label()).ok().flatten();
+
+        Ok(Self {
+            config,
+            user,
+            tasks,
+            checklists,
+            period,
+            summary,
+            ai_analysis,
+            tab: Tab::Kpi,
+            selected_task: 0,
+            status: "Готово".into(),
+        })
+    }
+
+    async fn refresh(&mut self, client: &BitrixClient) -> Result<()> {
+        self.status = "Обновление данных Bitrix…".into();
+        let user = client.current_user().await?;
+        let tasks = client.tasks_for_user(&user.id).await?;
+        let checklists = client.checklist_progress_for_open_tasks(&tasks).await;
+        self.user = user;
+        self.tasks = tasks;
+        self.checklists = checklists;
+        self.recalculate();
+        self.selected_task = self.selected_task.min(self.tasks.len().saturating_sub(1));
+        self.status = format!("Обновлено {}", Local::now().format("%H:%M:%S"));
+        Ok(())
+    }
+
+    fn recalculate(&mut self) {
+        self.summary = kpi::calculate(
+            &self.tasks,
+            &self.period,
+            &self.config.kpi,
+            &self.checklists,
+        );
+    }
+
+    fn previous_month(&mut self) {
+        self.period = self.period.previous();
+        self.recalculate();
+        self.ai_analysis = ai::load_analysis(&self.period.label()).ok().flatten();
+    }
+
+    fn next_month(&mut self) {
+        self.period = self.period.next();
+        self.recalculate();
+        self.ai_analysis = ai::load_analysis(&self.period.label()).ok().flatten();
+    }
+
+    async fn run_ai(&mut self, client: &BitrixClient) -> Result<()> {
+        anyhow::ensure!(
+            self.config.openrouter.configured(),
+            "OpenRouter не настроен. Выйди из TUI и выполни: bkpi ai setup"
+        );
+        let analysis = ai::run_analysis(
+            client,
+            &self.config,
+            &self.user,
+            &self.tasks,
+            &self.period,
+            None,
+        )
+        .await?;
+        ai::save_analysis(&analysis)?;
+        self.ai_analysis = Some(analysis);
+        Ok(())
+    }
+
+    fn selected_task(&self) -> Option<&Task> {
+        sorted_tasks(&self.tasks).get(self.selected_task).copied()
+    }
+}
+
+pub async fn run(client: BitrixClient, config: Config) -> Result<()> {
+    let mut app = App::load(&client, config).await?;
+
+    enable_raw_mode().context("Не удалось включить raw mode терминала")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("Не удалось открыть alternate screen")?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("Не удалось создать TUI terminal")?;
+    terminal.clear()?;
+
+    let run_result = run_loop(&mut terminal, &mut app, &client).await;
+
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+
+    run_result
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    client: &BitrixClient,
+) -> Result<()> {
+    loop {
+        terminal.draw(|frame| draw(frame, app))?;
+
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => break,
+            KeyCode::Char('1') => app.tab = Tab::Kpi,
+            KeyCode::Char('2') => app.tab = Tab::Ai,
+            KeyCode::Char('3') => app.tab = Tab::Tasks,
+            KeyCode::Char('4') | KeyCode::Char('?') => app.tab = Tab::Help,
+            KeyCode::Char('a') => {
+                app.tab = Tab::Ai;
+                app.status = format!(
+                    "AI анализ через {}…",
+                    app.config.openrouter.model
+                );
+                terminal.draw(|frame| draw(frame, app))?;
+                match app.run_ai(client).await {
+                    Ok(()) => {
+                        app.status = format!(
+                            "AI обновлён {}",
+                            Local::now().format("%H:%M:%S")
+                        );
+                    }
+                    Err(error) => app.status = format!("AI ошибка: {error:#}"),
+                }
+            }
+            KeyCode::Char('r') => {
+                app.status = "Обновление данных Bitrix…".into();
+                terminal.draw(|frame| draw(frame, app))?;
+                if let Err(error) = app.refresh(client).await {
+                    app.status = format!("Ошибка обновления: {error:#}");
+                }
+            }
+            KeyCode::Char('[') => app.previous_month(),
+            KeyCode::Char(']') => app.next_month(),
+            KeyCode::Down | KeyCode::Char('j') if app.tab == Tab::Tasks => {
+                let max = app.tasks.len().saturating_sub(1);
+                app.selected_task = (app.selected_task + 1).min(max);
+            }
+            KeyCode::Up | KeyCode::Char('k') if app.tab == Tab::Tasks => {
+                app.selected_task = app.selected_task.saturating_sub(1);
+            }
+            KeyCode::Home if app.tab == Tab::Tasks => app.selected_task = 0,
+            KeyCode::End if app.tab == Tab::Tasks => {
+                app.selected_task = app.tasks.len().saturating_sub(1)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn draw(frame: &mut Frame<'_>, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    draw_header(frame, chunks[0], app);
+    match app.tab {
+        Tab::Kpi => draw_kpi(frame, chunks[1], app),
+        Tab::Ai => draw_ai(frame, chunks[1], app),
+        Tab::Tasks => draw_tasks(frame, chunks[1], app),
+        Tab::Help => draw_help(frame, chunks[1], app),
+    }
+    draw_footer(frame, chunks[2], app);
+}
+
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let titles = vec!["1 KPI", "2 AI", "3 Tasks", "4 Help"];
+    let tabs = Tabs::new(titles)
+        .select(app.tab.index())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " bkpi · {} · {} · Senior ",
+                    app.user.display_name(),
+                    app.period.label()
+                )),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(tabs, area);
+}
+
+fn draw_kpi(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(9),
+            Constraint::Length(6),
+        ])
+        .split(area);
+
+    let ratio = if app.summary.max_payout_rub == 0 {
+        0.0
+    } else {
+        app.summary.confirmed_payout_rub as f64 / app.summary.max_payout_rub as f64
+    };
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Подтвержденная премия "),
+        )
+        .gauge_style(Style::default().fg(if ratio >= 0.85 { Color::Green } else { Color::Yellow }))
+        .ratio(ratio.clamp(0.0, 1.0))
+        .label(format!(
+            "{} ₽ / {} ₽",
+            app.summary.confirmed_payout_rub, app.summary.max_payout_rub
+        ));
+    frame.render_widget(gauge, chunks[0]);
+
+    let header = Row::new(vec!["KPI", "ФОНД", "ПРОГРЕСС", "СТАТУС", "ДЕТАЛИ"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = app.summary.indicators.iter().map(|indicator| {
+        let progress = indicator
+            .progress_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let style = match indicator.status {
+            IndicatorStatus::Met => Style::default().fg(Color::Green),
+            IndicatorStatus::Failed => Style::default().fg(Color::Red),
+            IndicatorStatus::Blocked => Style::default().fg(Color::Yellow),
+            IndicatorStatus::InProgress => Style::default().fg(Color::Cyan),
+            IndicatorStatus::NotConfigured => Style::default().fg(Color::DarkGray),
+        };
+        Row::new(vec![
+            Cell::from(indicator.kind.label()),
+            Cell::from(format!("{} ₽", indicator.payout_rub)),
+            Cell::from(progress),
+            Cell::from(indicator.status.label()),
+            Cell::from(truncate(&indicator.detail, 48)),
+        ])
+        .style(style)
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(27),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(17),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Наставничество и Senior "),
+    );
+    frame.render_widget(table, chunks[1]);
+
+    let measured = app
+        .summary
+        .measured_progress_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "—".into());
+    let plan_hint = if app.summary.plan_task_links == 0 {
+        "План не настроен: bkpi plan add result <TASK_ID> / initiative / improvement"
+    } else {
+        "Одна задача может быть привязана к нескольким KPI — регламент это допускает."
+    };
+    let text = format!(
+        "Измеримый прогресс: {} по фонду {} ₽\nОткрыто: {} · просрочено: {} · закрыто в периоде: {}\n{}\nQuality/Knowledge подтверждаются: bkpi evidence set <quality|knowledge> <met|failed|blocked> --note ...",
+        measured,
+        app.summary.measured_budget_rub,
+        app.summary.open_now,
+        app.summary.overdue_open_now,
+        app.summary.completed_in_period,
+        plan_hint
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title(" Сводка "))
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
+}
+
+fn draw_ai(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(analysis) = &app.ai_analysis else {
+        let text = if app.config.openrouter.configured() {
+            format!(
+                "AI-анализ за {} ещё не запускался.\n\nНажми [a], чтобы собрать актуальные задачи/чеклисты Bitrix и отправить snapshot через {}.\n\nPrivacy: ZDR={} · deny_data_collection={} · descriptions={}\n\nCLI: bkpi ai analyze --month {}",
+                app.period.label(),
+                app.config.openrouter.model,
+                app.config.openrouter.zdr,
+                app.config.openrouter.deny_data_collection,
+                app.config.openrouter.include_descriptions,
+                app.period.label()
+            )
+        } else {
+            "OpenRouter не настроен.\n\nВыйди из TUI и выполни:\n  bkpi ai setup\n  bkpi ai doctor\n\nПосле этого вернись и нажми [a].".into()
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title(" AI · OpenRouter "))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(9),
+            Constraint::Min(9),
+            Constraint::Length(9),
+        ])
+        .split(area);
+
+    let legacy = analysis.result.estimated_payout_rub.unwrap_or(0);
+    let confirmed = analysis.result.confirmed_payout_rub.unwrap_or(legacy);
+    let likely = analysis.result.likely_payout_rub.unwrap_or(confirmed);
+    let potential = analysis.result.potential_payout_rub.unwrap_or(170_000);
+    let usage = analysis
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.total_tokens)
+        .map(|value| format!("{value} tokens"))
+        .unwrap_or_else(|| "tokens —".into());
+    let cost = analysis
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.cost)
+        .map(|value| format!("${value:.6}"))
+        .unwrap_or_else(|| "cost —".into());
+    let executive = ai::humanize_task_refs(analysis, &analysis.result.executive_summary);
+    let summary = format!(
+        "{}\nAI status: {}\nподтверждено: {} ₽ · вероятно: {} ₽ · потенциал: {} ₽ / 170000 ₽\nmodel: {} · {} · {}\ngenerated: {}\n[a] запустить заново",
+        truncate(&executive, 180),
+        analysis.result.overall_status,
+        confirmed,
+        likely,
+        potential,
+        analysis.model_used,
+        usage,
+        cost,
+        analysis.generated_at
+    );
+    frame.render_widget(
+        Paragraph::new(summary)
+            .block(Block::default().borders(Borders::ALL).title(" AI сводка "))
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let header = Row::new(vec!["KPI", "AI STATUS", "EVIDENCE", "PROGRESS", "CONF", "ОБОСНОВАНИЕ"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = analysis.result.indicators.iter().map(|indicator| {
+        let progress = indicator
+            .progress_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let style = match indicator.status.as_str() {
+            "met" | "likely_met" => Style::default().fg(Color::Green),
+            "risk" => Style::default().fg(Color::Red),
+            "blocked" => Style::default().fg(Color::Yellow),
+            "in_progress" => Style::default().fg(Color::Cyan),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        let rationale = ai::humanize_task_refs(analysis, &indicator.rationale);
+        Row::new(vec![
+            Cell::from(indicator.kind.clone()),
+            Cell::from(indicator.status.clone()),
+            Cell::from(indicator.evidence_level.clone()),
+            Cell::from(progress),
+            Cell::from(format!("{:.0}%", indicator.confidence * 100.0)),
+            Cell::from(truncate(&rationale, 56)),
+        ])
+        .style(style)
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(13),
+            Constraint::Length(16),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Min(18),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(Block::default().borders(Borders::ALL).title(" AI оценка KPI "));
+    frame.render_widget(table, chunks[1]);
+
+    let mut lines = Vec::new();
+    if !analysis.result.next_actions.is_empty() {
+        lines.push("Следующие действия:".to_string());
+        for action in analysis.result.next_actions.iter().take(3) {
+            let action = ai::humanize_task_refs(analysis, action);
+            lines.push(format!("• {}", truncate(&action, 110)));
+        }
+    }
+    if !analysis.result.risks.is_empty() {
+        lines.push("Риски:".to_string());
+        for risk in analysis.result.risks.iter().take(2) {
+            let risk = ai::humanize_task_refs(analysis, risk);
+            lines.push(format!("• {}", truncate(&risk, 110)));
+        }
+    }
+    if !analysis.result.questions.is_empty() {
+        let question = ai::humanize_task_refs(analysis, &analysis.result.questions[0]);
+        lines.push(format!("Уточнить: {}", truncate(&question, 105)));
+    }
+    if lines.is_empty() {
+        lines.push("Модель не вернула дополнительных действий/рисков.".into());
+    }
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .block(Block::default().borders(Borders::ALL).title(" Рекомендации "))
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
+}
+
+fn draw_tasks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(7)])
+        .split(area);
+
+    let tasks = sorted_tasks(&app.tasks);
+    let header = Row::new(vec!["ID", "STATUS", "PROGRESS", "DEADLINE", "TITLE"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let visible_rows = chunks[0].height.saturating_sub(3).max(1) as usize;
+    let start = if app.selected_task >= visible_rows {
+        app.selected_task + 1 - visible_rows
+    } else {
+        0
+    };
+
+    let rows = tasks
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, task)| {
+            let progress = kpi::task_progress(task, app.checklists.get(&task.id));
+            let deadline = task
+                .deadline
+                .as_deref()
+                .and_then(kpi::parse_datetime)
+                .map(|date| date.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "—".into());
+            let style = if index == app.selected_task {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if status_label(task, Utc::now()) == "OVERDUE" {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![
+                Cell::from(task.id.clone()),
+                Cell::from(status_label(task, Utc::now())),
+                Cell::from(format!("{:>5.1}%", progress.percent)),
+                Cell::from(deadline),
+                Cell::from(truncate(&task.title, 64)),
+            ])
+            .style(style)
+        });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(17),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(Block::default().borders(Borders::ALL).title(" Задачи "));
+    frame.render_widget(table, chunks[0]);
+
+    draw_task_details(frame, chunks[1], app);
+}
+
+fn draw_task_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(task) = app.selected_task() else {
+        frame.render_widget(
+            Paragraph::new("Задач нет")
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title(" Детали ")),
+            area,
+        );
+        return;
+    };
+
+    let progress = kpi::task_progress(task, app.checklists.get(&task.id));
+    let source = if progress.checklist_total > 0 {
+        format!(
+            "checklist {}/{}",
+            progress.checklist_completed, progress.checklist_total
+        )
+    } else {
+        progress.source_label().into()
+    };
+    let deadline = task
+        .deadline
+        .as_deref()
+        .and_then(kpi::parse_datetime)
+        .map(|date| date.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".into());
+
+    let text = format!(
+        "#{}  {}\nСтатус: {} · прогресс: {:.1}% ({}) · дедлайн: {}\nИзменено: {}",
+        task.id,
+        task.title,
+        status_label(task, Utc::now()),
+        progress.percent,
+        source,
+        deadline,
+        task.changed_date.as_deref().unwrap_or("—")
+    );
+
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title(" Детали "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let text = vec![
+        Line::from(vec![
+            Span::styled("q / Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  выход"),
+        ]),
+        Line::from("1 / 2 / 3 / 4  вкладки KPI / AI / Tasks / Help"),
+        Line::from("r          обновить задачи и чеклисты из Bitrix"),
+        Line::from("a          запустить свежий AI-анализ OpenRouter и сохранить кэш"),
+        Line::from("[ / ]      предыдущий / следующий месяц"),
+        Line::from("↑ ↓ / j k  выбрать задачу на вкладке Tasks"),
+        Line::from(""),
+        Line::from("OpenRouter:"),
+        Line::from("bkpi ai setup"),
+        Line::from("bkpi ai doctor"),
+        Line::from("bkpi ai analyze"),
+        Line::from("bkpi ai plan          # интерактивно"),
+        Line::from("bkpi ai plan --apply  # применить всё выше порога"),
+        Line::from(""),
+        Line::from("Настройка плана:"),
+        Line::from("bkpi plan add result <TASK_ID> --weight 1"),
+        Line::from("bkpi plan add initiative <TASK_ID>"),
+        Line::from("bkpi plan add improvement <TASK_ID>"),
+        Line::from("bkpi plan list"),
+        Line::from(""),
+        Line::from("Ручные подтверждения:"),
+        Line::from("bkpi evidence set quality met --note \"...\""),
+        Line::from("bkpi evidence set knowledge met --note \"ссылка/артефакт\""),
+        Line::from(""),
+        Line::from(format!(
+            "Профиль: {} · фонд {} ₽ · порог согласованного результата {:.0}%",
+            app.config.kpi.profile_label(),
+            app.config.kpi.max_payout_rub(),
+            app.config.kpi.result_threshold_percent
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title(" Help "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let footer = Line::from(vec![
+        Span::raw(" q quit  "),
+        Span::raw("r refresh  "),
+        Span::raw("a AI  "),
+        Span::raw("[ ] month  "),
+        Span::styled(app.status.as_str(), Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(footer), area);
+}
+
+fn sorted_tasks(tasks: &[Task]) -> Vec<&Task> {
+    let now = Utc::now();
+    let mut tasks: Vec<&Task> = tasks.iter().collect();
+    tasks.sort_by(|a, b| {
+        let a_closed = a.is_closed();
+        let b_closed = b.is_closed();
+        a_closed
+            .cmp(&b_closed)
+            .then_with(|| {
+                let a_overdue = !a_closed
+                    && a.deadline
+                        .as_deref()
+                        .and_then(kpi::parse_datetime)
+                        .is_some_and(|deadline| deadline < now);
+                let b_overdue = !b_closed
+                    && b.deadline
+                        .as_deref()
+                        .and_then(kpi::parse_datetime)
+                        .is_some_and(|deadline| deadline < now);
+                b_overdue.cmp(&a_overdue)
+            })
+            .then_with(|| {
+                let a_deadline = a
+                    .deadline
+                    .as_deref()
+                    .and_then(kpi::parse_datetime)
+                    .map(|date| date.timestamp())
+                    .unwrap_or(i64::MAX);
+                let b_deadline = b
+                    .deadline
+                    .as_deref()
+                    .and_then(kpi::parse_datetime)
+                    .map(|date| date.timestamp())
+                    .unwrap_or(i64::MAX);
+                a_deadline.cmp(&b_deadline)
+            })
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    tasks
+}

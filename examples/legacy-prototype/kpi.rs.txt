@@ -1,0 +1,405 @@
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+
+use crate::bitrix::{ChecklistProgress, Task};
+use crate::config::{EvidenceState, KpiConfig, KpiKind, PeriodPlan, KPI_KINDS};
+
+#[derive(Debug, Clone)]
+pub struct Period {
+    pub year: i32,
+    pub month: u32,
+    pub start: NaiveDate,
+    pub end: NaiveDate,
+}
+
+impl Period {
+    pub fn parse_or_current(value: Option<&str>) -> Result<Self> {
+        let (year, month) = match value {
+            Some(value) => {
+                let date = NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
+                    .with_context(|| format!("Некорректный месяц {value}; нужен YYYY-MM"))?;
+                (date.year(), date.month())
+            }
+            None => {
+                let now = Local::now();
+                (now.year(), now.month())
+            }
+        };
+        Self::new(year, month)
+    }
+
+    pub fn new(year: i32, month: u32) -> Result<Self> {
+        let start = NaiveDate::from_ymd_opt(year, month, 1).context("Некорректный месяц")?;
+        let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+        let next = NaiveDate::from_ymd_opt(ny, nm, 1).context("Некорректный следующий месяц")?;
+        let end = next.pred_opt().context("Не удалось определить конец месяца")?;
+        Ok(Self { year, month, start, end })
+    }
+
+    pub fn label(&self) -> String {
+        format!("{:04}-{:02}", self.year, self.month)
+    }
+
+    pub fn previous(&self) -> Self {
+        let (year, month) = if self.month == 1 {
+            (self.year - 1, 12)
+        } else {
+            (self.year, self.month - 1)
+        };
+        Self::new(year, month).expect("previous period is valid")
+    }
+
+    pub fn next(&self) -> Self {
+        let (year, month) = if self.month == 12 {
+            (self.year + 1, 1)
+        } else {
+            (self.year, self.month + 1)
+        };
+        Self::new(year, month).expect("next period is valid")
+    }
+
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        date >= self.start && date <= self.end
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressSource {
+    Closed,
+    Checklist,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TaskProgress {
+    pub percent: f64,
+    pub source: ProgressSource,
+    pub checklist_completed: usize,
+    pub checklist_total: usize,
+}
+
+impl TaskProgress {
+    pub fn source_label(&self) -> &'static str {
+        match self.source {
+            ProgressSource::Closed => "closed",
+            ProgressSource::Checklist => "checklist",
+            ProgressSource::Status => "status",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorStatus {
+    NotConfigured,
+    InProgress,
+    Met,
+    Failed,
+    Blocked,
+}
+
+impl IndicatorStatus {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::InProgress => "in_progress",
+            Self::Met => "met",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "не настроено",
+            Self::InProgress => "в работе",
+            Self::Met => "✓ выполнено",
+            Self::Failed => "✗ не выполнено",
+            Self::Blocked => "⚠ блокировка",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndicatorSummary {
+    pub kind: KpiKind,
+    pub payout_rub: u32,
+    pub progress_percent: Option<f64>,
+    pub status: IndicatorStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KpiSummary {
+    pub indicators: Vec<IndicatorSummary>,
+    pub confirmed_payout_rub: u32,
+    pub max_payout_rub: u32,
+    pub measured_progress_percent: Option<f64>,
+    pub measured_budget_rub: u32,
+    pub plan_task_links: usize,
+    pub completed_in_period: usize,
+    pub open_now: usize,
+    pub overdue_open_now: usize,
+}
+
+pub fn calculate(
+    tasks: &[Task],
+    period: &Period,
+    config: &KpiConfig,
+    checklists: &HashMap<String, ChecklistProgress>,
+) -> KpiSummary {
+    let plan = config.plan(&period.label());
+    let by_id: HashMap<&str, &Task> = tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+
+    let mut indicators = Vec::with_capacity(KPI_KINDS.len());
+    for kind in KPI_KINDS {
+        indicators.push(calculate_indicator(kind, &plan, &by_id, checklists, config));
+    }
+
+    let confirmed_payout_rub = indicators
+        .iter()
+        .filter(|indicator| indicator.status == IndicatorStatus::Met)
+        .map(|indicator| indicator.payout_rub)
+        .sum();
+
+    let mut measured_sum = 0.0;
+    let mut measured_budget_rub = 0u32;
+    for indicator in &indicators {
+        if let Some(progress) = indicator.progress_percent {
+            measured_sum += progress * indicator.payout_rub as f64;
+            measured_budget_rub += indicator.payout_rub;
+        }
+    }
+    let measured_progress_percent = (measured_budget_rub > 0)
+        .then(|| measured_sum / measured_budget_rub as f64);
+
+    let now = Utc::now();
+    let open_now = tasks.iter().filter(|task| !task.is_closed()).count();
+    let overdue_open_now = tasks
+        .iter()
+        .filter(|task| {
+            !task.is_closed()
+                && task
+                    .deadline
+                    .as_deref()
+                    .and_then(parse_datetime)
+                    .is_some_and(|deadline| deadline < now)
+        })
+        .count();
+    let completed_in_period = tasks
+        .iter()
+        .filter(|task| {
+            task.closed_date
+                .as_deref()
+                .and_then(parse_datetime)
+                .is_some_and(|closed| period.contains(closed.with_timezone(&Local).date_naive()))
+        })
+        .count();
+
+    KpiSummary {
+        indicators,
+        confirmed_payout_rub,
+        max_payout_rub: config.max_payout_rub(),
+        measured_progress_percent,
+        measured_budget_rub,
+        plan_task_links: plan.tasks.len(),
+        completed_in_period,
+        open_now,
+        overdue_open_now,
+    }
+}
+
+fn calculate_indicator(
+    kind: KpiKind,
+    plan: &PeriodPlan,
+    by_id: &HashMap<&str, &Task>,
+    checklists: &HashMap<String, ChecklistProgress>,
+    config: &KpiConfig,
+) -> IndicatorSummary {
+    if kind.supports_task_links() {
+        return calculate_task_indicator(kind, plan, by_id, checklists, config);
+    }
+
+    let evidence = plan.evidence.get(kind).expect("manual KPI has evidence slot");
+    let (status, progress_percent) = match evidence.state {
+        EvidenceState::Pending => (IndicatorStatus::NotConfigured, None),
+        EvidenceState::Met => (IndicatorStatus::Met, Some(100.0)),
+        EvidenceState::Failed => (IndicatorStatus::Failed, Some(0.0)),
+        EvidenceState::Blocked => (IndicatorStatus::Blocked, None),
+    };
+    let detail = evidence
+        .note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(evidence.state.label())
+        .to_string();
+
+    IndicatorSummary {
+        kind,
+        payout_rub: kind.payout_rub(),
+        progress_percent,
+        status,
+        detail,
+    }
+}
+
+fn calculate_task_indicator(
+    kind: KpiKind,
+    plan: &PeriodPlan,
+    by_id: &HashMap<&str, &Task>,
+    checklists: &HashMap<String, ChecklistProgress>,
+    config: &KpiConfig,
+) -> IndicatorSummary {
+    let links: Vec<_> = plan.tasks.iter().filter(|item| item.kind == kind).collect();
+    if links.is_empty() {
+        return IndicatorSummary {
+            kind,
+            payout_rub: kind.payout_rub(),
+            progress_percent: None,
+            status: IndicatorStatus::NotConfigured,
+            detail: "нет привязанных задач".into(),
+        };
+    }
+
+    let mut missing_tasks = 0usize;
+    let mut values = Vec::new();
+    let mut ready_weight = 0.0;
+    let mut total_weight = 0.0;
+    let mut any_ready = false;
+
+    for link in &links {
+        total_weight += link.weight;
+        let Some(task) = by_id.get(link.task_id.as_str()) else {
+            missing_tasks += 1;
+            values.push((0.0, link.weight));
+            continue;
+        };
+
+        let progress = task_progress(task, checklists.get(&task.id));
+        values.push((progress.percent, link.weight));
+        if task_ready_for_acceptance(task) {
+            ready_weight += link.weight;
+            any_ready = true;
+        }
+    }
+
+    let progress = match kind {
+        KpiKind::Result => {
+            let weight_sum: f64 = values.iter().map(|(_, weight)| *weight).sum();
+            if weight_sum > 0.0 {
+                values.iter().map(|(value, weight)| value * weight).sum::<f64>() / weight_sum
+            } else {
+                0.0
+            }
+        }
+        KpiKind::Initiative | KpiKind::Improvement => values
+            .iter()
+            .map(|(value, _)| *value)
+            .fold(0.0, f64::max),
+        _ => 0.0,
+    };
+
+    let ready_volume_percent = if total_weight > 0.0 {
+        ready_weight / total_weight * 100.0
+    } else {
+        0.0
+    };
+
+    let status = match kind {
+        KpiKind::Result => {
+            if ready_volume_percent + f64::EPSILON >= config.result_threshold_percent {
+                IndicatorStatus::Met
+            } else {
+                IndicatorStatus::InProgress
+            }
+        }
+        KpiKind::Initiative | KpiKind::Improvement => {
+            if any_ready {
+                IndicatorStatus::Met
+            } else {
+                IndicatorStatus::InProgress
+            }
+        }
+        _ => IndicatorStatus::NotConfigured,
+    };
+
+    let missing_suffix = if missing_tasks > 0 {
+        format!(", {} не найдены в выдаче Bitrix", missing_tasks)
+    } else {
+        String::new()
+    };
+    let detail = match kind {
+        KpiKind::Result => format!(
+            "готово к приемке {:.1}% объёма · порог {:.0}%{}",
+            ready_volume_percent, config.result_threshold_percent, missing_suffix
+        ),
+        KpiKind::Initiative => format!(
+            "{} привязанных инициатив(ы) · нужна ≥1 готовая к приемке{}",
+            links.len(), missing_suffix
+        ),
+        KpiKind::Improvement => format!(
+            "{} привязанных улучшений(я) · нужно ≥1 готовое к приемке{}",
+            links.len(), missing_suffix
+        ),
+        _ => String::new(),
+    };
+
+    IndicatorSummary {
+        kind,
+        payout_rub: kind.payout_rub(),
+        progress_percent: Some(progress.clamp(0.0, 100.0)),
+        status,
+        detail,
+    }
+}
+
+fn task_ready_for_acceptance(task: &Task) -> bool {
+    task.is_closed() || task.status == "4"
+}
+
+pub fn task_progress(task: &Task, checklist: Option<&ChecklistProgress>) -> TaskProgress {
+    if task.is_closed() {
+        return TaskProgress {
+            percent: 100.0,
+            source: ProgressSource::Closed,
+            checklist_completed: 0,
+            checklist_total: 0,
+        };
+    }
+
+    if let Some(checklist) = checklist {
+        if let Some(percent) = checklist.percent() {
+            return TaskProgress {
+                percent,
+                source: ProgressSource::Checklist,
+                checklist_completed: checklist.completed,
+                checklist_total: checklist.total,
+            };
+        }
+    }
+
+    // Это только operational proxy для dashboard, а не официальный критерий регламента.
+    // status=4 («ожидает контроля») считаем технической готовностью к приемке и поэтому 100%.
+    let percent = match task.status.as_str() {
+        "2" => 0.0,
+        "3" => 50.0,
+        "4" => 100.0,
+        "5" => 100.0,
+        "6" => 0.0,
+        _ => 0.0,
+    };
+
+    TaskProgress {
+        percent,
+        source: ProgressSource::Status,
+        checklist_completed: 0,
+        checklist_total: 0,
+    }
+}
+
+pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}

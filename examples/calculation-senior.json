@@ -1,0 +1,28 @@
+{
+  "person": "self",
+  "period": "2026-09",
+  "planned_available_days": 21,
+  "actual_worked_days": 21,
+  "assessments": [
+    {
+      "criterion_id": "delivery",
+      "progress": "0.92"
+    },
+    {
+      "criterion_id": "initiative",
+      "level": "full"
+    },
+    {
+      "criterion_id": "automation",
+      "level": "full"
+    },
+    {
+      "criterion_id": "quality",
+      "level": "full"
+    },
+    {
+      "criterion_id": "knowledge",
+      "level": "full"
+    }
+  ]
+}

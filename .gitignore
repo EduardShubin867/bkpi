@@ -1,0 +1,10 @@
+/target
+.DS_Store
+*.log
+
+.bkpi/
+**/graphify-out/
+installer/node_modules/
+installer/dist/
+installer/bundles/
+installer/*.tgz

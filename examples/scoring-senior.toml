@@ -1,0 +1,98 @@
+# Example only. Copy explicitly into a workspace; never a runtime default.
+# Payout amounts are whole RUB; decimal fractions are exact strings.
+currency = "RUB"
+money_scale = 0
+max_payout = 170000
+rounding = "half_up_per_criterion"
+
+[time]
+enabled = true
+mode = "actual_over_planned"
+cap = "1"
+
+[[criteria]]
+id = "delivery"
+title = "Согласованный технический результат"
+max_payout = 40000
+input = "progress"
+
+[[criteria.levels]]
+id = "full"
+min_progress = "0.85"
+factor = "1"
+
+[[criteria.levels]]
+id = "none"
+factor = "0"
+
+[[criteria]]
+id = "initiative"
+title = "Самостоятельное ведение инициативы"
+max_payout = 50000
+input = "level"
+
+[[criteria.levels]]
+id = "full"
+factor = "1"
+
+[[criteria.levels]]
+id = "partial"
+factor = "0.5"
+
+[[criteria.levels]]
+id = "none"
+factor = "0"
+
+[[criteria]]
+id = "automation"
+title = "Автоматизация"
+max_payout = 20000
+input = "level"
+
+[[criteria.levels]]
+id = "full"
+factor = "1"
+
+[[criteria.levels]]
+id = "partial"
+factor = "0.5"
+
+[[criteria.levels]]
+id = "none"
+factor = "0"
+
+[[criteria]]
+id = "quality"
+title = "Качество"
+max_payout = 20000
+input = "level"
+
+[[criteria.levels]]
+id = "full"
+factor = "1"
+
+[[criteria.levels]]
+id = "partial"
+factor = "0.5"
+
+[[criteria.levels]]
+id = "none"
+factor = "0"
+
+[[criteria]]
+id = "knowledge"
+title = "Передача знаний"
+max_payout = 40000
+input = "level"
+
+[[criteria.levels]]
+id = "full"
+factor = "1"
+
+[[criteria.levels]]
+id = "partial"
+factor = "0.5"
+
+[[criteria.levels]]
+id = "none"
+factor = "0"

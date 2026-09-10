@@ -1,0 +1,11 @@
+#[cfg(feature = "standalone-ai")]
+pub mod ai;
+pub mod bitrix;
+pub mod cli;
+pub mod config;
+pub mod credentials;
+pub mod mcp;
+pub mod plan;
+pub mod scoring;
+pub mod snapshot;
+pub mod workspace;

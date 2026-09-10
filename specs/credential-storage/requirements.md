@@ -1,0 +1,1 @@
+Make file the default; retain keyring/file references and workspace/MCP contracts. Add env, metadata-only show, verified transactional move, permission repair, masked setup and idempotent updates. No secret in argv/output/logs. Back up schema and legacy migrations before writes.

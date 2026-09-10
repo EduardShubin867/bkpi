@@ -1,0 +1,205 @@
+use clap::{Args, Parser, Subcommand};
+
+use crate::config::{EvidenceState, KpiKind};
+
+#[derive(Debug, Parser)]
+#[command(name = "bkpi", version, about = "Bitrix24 задачи, Senior KPI и AI-анализ")]
+pub struct Cli {
+    /// Без команды открывается интерактивный TUI dashboard.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Один раз сохранить входящий Bitrix24 webhook.
+    Init {
+        /// URL вида https://company.bitrix24.ru/rest/123/token/
+        webhook: String,
+    },
+
+    /// Работа с локальным конфигом.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
+    /// План KPI: привязать Bitrix-задачи к показателям Senior-профиля.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+
+    /// Ручное подтверждение KPI, которые нельзя честно вывести из статуса задачи.
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+
+    /// OpenRouter: AI-анализ задач/KPI и автоматические предложения по плану.
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
+    },
+
+    /// Проверить webhook и доступ к задачам.
+    Doctor,
+
+    /// Показать мои задачи.
+    Tasks(TasksArgs),
+
+    /// Показать KPI за месяц.
+    Kpi {
+        /// Месяц в формате YYYY-MM. По умолчанию текущий.
+        #[arg(long)]
+        month: Option<String>,
+    },
+
+    /// Явно открыть интерактивный dashboard (то же самое, что просто `bkpi`).
+    Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Путь к config.toml.
+    Path,
+    /// Показать настройки; секреты webhook/OpenRouter будут скрыты.
+    Show,
+    /// Обновить webhook.
+    SetWebhook { webhook: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AiCommand {
+    /// Сохранить OpenRouter API key, не показывая его в shell history.
+    Setup {
+        /// Сразу выбрать модель. По умолчанию openrouter/auto.
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Изменить OpenRouter model slug.
+    Model { model: String },
+
+    /// Показать или изменить privacy-настройки AI-запросов.
+    Privacy {
+        /// Требовать Zero Data Retention endpoint.
+        #[arg(long)]
+        zdr: Option<bool>,
+        /// Запрещать провайдеров, собирающих/использующих входные данные.
+        #[arg(long)]
+        deny_data_collection: Option<bool>,
+        /// Отправлять описания Bitrix-задач в модель.
+        #[arg(long)]
+        descriptions: Option<bool>,
+    },
+
+    /// Проверить API key через OpenRouter /api/v1/key, без генерации токенов.
+    Doctor,
+
+    /// Собрать snapshot Bitrix + KPI и прогнать его через модель. Результат кэшируется.
+    Analyze {
+        #[arg(long)]
+        month: Option<String>,
+        /// Разово переопределить модель, не меняя config.toml.
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Показать последний сохранённый AI-анализ периода.
+    Show {
+        #[arg(long)]
+        month: Option<String>,
+    },
+
+    /// Интерактивно разобрать AI-предложения по task → KPI. --apply применяет всё автоматически.
+    Plan {
+        #[arg(long)]
+        month: Option<String>,
+        /// Без вопросов применить все предложения выше порога.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Только показать предложения, ничего не спрашивать и не менять.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long, default_value_t = 0.75)]
+        min_confidence: f64,
+    },
+
+    /// Удалить локальный кэш AI-анализа периода.
+    Clear {
+        #[arg(long)]
+        month: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlanCommand {
+    /// Привязать задачу к KPI. Одна задача может закрывать несколько KPI.
+    Add {
+        kind: KpiKind,
+        task_id: String,
+        /// Вес внутри «Согласованного результата». Для остальных KPI обычно оставь 1.
+        #[arg(long, default_value_t = 1.0)]
+        weight: f64,
+        /// Период YYYY-MM. По умолчанию текущий месяц.
+        #[arg(long)]
+        month: Option<String>,
+    },
+    /// Убрать привязку задачи.
+    Remove {
+        kind: KpiKind,
+        task_id: String,
+        #[arg(long)]
+        month: Option<String>,
+    },
+    /// Показать план периода.
+    List {
+        #[arg(long)]
+        month: Option<String>,
+    },
+    /// Очистить все task-привязки периода или только один KPI.
+    Clear {
+        kind: Option<KpiKind>,
+        #[arg(long)]
+        month: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvidenceCommand {
+    /// Установить ручное подтверждение для quality/knowledge.
+    Set {
+        kind: KpiKind,
+        state: EvidenceState,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        month: Option<String>,
+    },
+    /// Сбросить подтверждение в pending.
+    Clear {
+        kind: KpiKind,
+        #[arg(long)]
+        month: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct TasksArgs {
+    /// Только открытые задачи.
+    #[arg(long)]
+    pub open: bool,
+
+    /// Только открытые просроченные задачи.
+    #[arg(long)]
+    pub late: bool,
+
+    /// Только завершённые задачи.
+    #[arg(long)]
+    pub closed: bool,
+
+    /// Максимум строк в выводе.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}

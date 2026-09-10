@@ -1,0 +1,7 @@
+# Design
+Keep one Rust crate. Existing bitrix.rs retains DTOs and read methods; add safe transport, pagination bounds and shared concurrency. workspace.rs owns domain/files, config.rs global metadata, credentials.rs credential boundary, snapshot.rs orchestrates data, mcp.rs protocol only, cli.rs terminal workflows. No score engine. Archive prototype source outside Cargo.
+MCP accepts an explicit current-project workspace argument, otherwise discovers from cwd. When launched with --workspace, it binds to that root and rejects other workspaces. Agent adapters register user scoped stdio using official CLIs and install a shared skill. No direct agent config rewrites. Secrets entered by runtime masked prompt, never installer argv.
+Snapshot detail limit is explicit with omissions/errors. Team snapshots preserve individual shape; shared portal clients bound concurrency. Period task selection uses open during month or activity within month and local mapping IDs.
+Migration is explicit and transactional at config-file boundary: secure original backup, move webhook and OpenRouter key into credential store, preserve legacy plans as backup only. Never interpret the legacy profile automatically.
+
+Runtime target registration uses official CLIs and user-scoped standalone skills. Alternative plugin bundles are generated from the same source; no real marketplace or user agent configuration was mutated during development.

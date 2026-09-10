@@ -1,0 +1,73 @@
+Actual macOS PTY output; ANSI controls stripped. Local runtime installed from release binary. Bitrix integration preseeded to local HTTP fixture; no live webhook registration or OS keychain validation. Setup selected CLI only.
+
+┌  BKPI setup
+│
+●  Runtime: /private/tmp/bkpi-onboarding-frhz_mtl/install/bin/bkpi; targets: CLI only
+│
+◆  What would you like to do?
+│  ● Add Bitrix integration
+│  ○ Update an existing webhook
+│  ○ Add or remove agent targets
+│  ○ Remove integration
+│  ○ Update runtime
+│  ○ Migrate legacy config
+│  ○ Finish
+│  ↑/↓ to navigate • Enter: confirm
+└
+│  ○ Add Bitrix integration
+│  ● Update an existing webhook
+│  ○ Add or remove agent targets
+│  ○ Remove integration
+│  ○ Update runtime
+│  ○ Migrate legacy config
+│  ○ Finish
+│  ↑/↓ to navigate • Enter: confirm
+└
+│  ○ Update an existing webhook
+│  ● Add or remove agent targets
+│  ○ Remove integration
+│  ○ Update runtime
+│  ○ Migrate legacy config
+│  ○ Finish
+│  ↑/↓ to navigate • Enter: confirm
+└
+◇  What would you like to do?
+│  Add or remove agent targets
+│
+◆  Agent targets (empty = CLI only)
+│  ◻ Codex
+│  ◻ Claude Code
+│  ↑/↓ to navigate • Space: select • Enter: confirm
+└
+◇  Agent targets (empty = CLI only)
+│  none
+│
+└  Ready. Add /private/tmp/bkpi-onboarding-frhz_mtl/install/bin to your user PATH. Restart your terminal afterward. The agent registrations use the absolute runtime path. Run bkpi init in your project.
+
+
+┌ BKPI workspace
+│ /private/tmp/bkpi-onboarding-frhz_mtl/my-kpi
+? Create workspace here? (y/n) › noy✔ Create workspace here? · yes
+◇ Bitrix integration
+│ Астро-Волга
+? Who should be added? ›
+❯ Me
+  Search employees
+
+✔ Who should be added? · Me
+◇ Person
+│ Эдуард Шубин
+? Do you already have a KPI document? (path, or Enter to skip) › /private/tmp/bkpi-onboarding-frhz_mtl/Downloads/my KPI.txt✔ Do you already have a KPI document? (path, or Enter to skip) · /private/tmp/bkpi-onboarding-frhz_mtl/Downloads/my KPI.txt
+? Copy KPI document into this workspace? (y/n) › yes✔ Copy KPI document into this workspace? · yes
+◆ Workspace created
+
+Person:
+  Эдуард Шубин
+
+KPI document:
+  /private/tmp/bkpi-onboarding-frhz_mtl/my-kpi/KPI.md
+
+Open this directory in Codex/Claude:
+  /private/tmp/bkpi-onboarding-frhz_mtl/my-kpi
+and ask:
+  "Проанализируй мои KPI и задачи в Bitrix."

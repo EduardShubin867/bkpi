@@ -1,0 +1,3 @@
+# Requirements
+One workspace, arbitrary people across global integrations. Markdown KPI has no built-in rubric. Conversation documents take precedence in the skill. Missing KPI means insufficient data. Bitrix is strictly read-only. Only local state tools write. Secrets never cross the agent boundary, argv or workspace. Preserve pagination, details, checklists/results and optional explicit AI.
+Acceptance: versioned workspace/config, secure credentials with explicit file fallback, backed-up migration, stdio MCP and JSON CLI sharing snapshots, target adapters, checksum installer, release matrix, passing Rust/npm checks.

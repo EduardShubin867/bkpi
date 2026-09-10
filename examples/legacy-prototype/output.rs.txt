@@ -1,0 +1,304 @@
+use std::collections::HashMap;
+
+use chrono::{Local, Utc};
+
+use crate::bitrix::{ChecklistProgress, Task, User};
+use crate::cli::TasksArgs;
+use crate::config::{KpiConfig, PeriodPlan, KPI_KINDS};
+use crate::kpi::{self, KpiSummary, Period};
+
+pub fn print_tasks(
+    tasks: &[Task],
+    args: &TasksArgs,
+    checklists: &HashMap<String, ChecklistProgress>,
+) {
+    let now = Utc::now();
+    let mut selected: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| {
+            if args.late {
+                return !task.is_closed()
+                    && task
+                        .deadline
+                        .as_deref()
+                        .and_then(kpi::parse_datetime)
+                        .is_some_and(|deadline| deadline < now);
+            }
+            if args.open {
+                return !task.is_closed();
+            }
+            if args.closed {
+                return task.is_closed();
+            }
+            true
+        })
+        .collect();
+
+    selected.sort_by_key(|task| {
+        task.deadline
+            .as_deref()
+            .and_then(kpi::parse_datetime)
+            .map(|d| d.timestamp())
+            .unwrap_or(i64::MAX)
+    });
+
+    println!(
+        "{:<8} {:<12} {:<9} {:<18} {}",
+        "ID", "STATUS", "PROGRESS", "DEADLINE", "TITLE"
+    );
+    println!("{}", "-".repeat(100));
+
+    for task in selected.into_iter().take(args.limit) {
+        let status = status_label(task, now);
+        let progress = kpi::task_progress(task, checklists.get(&task.id));
+        let progress_label = format!("{:>5.1}%", progress.percent);
+        let deadline = task
+            .deadline
+            .as_deref()
+            .and_then(kpi::parse_datetime)
+            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "{:<8} {:<12} {:<9} {:<18} {}",
+            truncate(&task.id, 8),
+            status,
+            progress_label,
+            deadline,
+            truncate(&task.title, 52)
+        );
+    }
+}
+
+pub fn print_kpi(user: &User, period: &Period, summary: &KpiSummary, config: &KpiConfig) {
+    println!(
+        "{} · KPI {} · {}",
+        user.display_name(),
+        period.label(),
+        config.profile_label()
+    );
+    println!("{}", "=".repeat(86));
+    println!(
+        "Подтверждено премии: {:>7} ₽ / {:>7} ₽",
+        summary.confirmed_payout_rub, summary.max_payout_rub
+    );
+    match summary.measured_progress_percent {
+        Some(value) => println!(
+            "Измеримый прогресс:   {:>6.1}%  (по KPI на {:>7} ₽, где есть task/evidence данные)",
+            value, summary.measured_budget_rub
+        ),
+        None => println!("Измеримый прогресс:        —   (план периода ещё не настроен)"),
+    }
+    println!();
+
+    println!("{:<29} {:>9} {:>10} {:<18} {}", "ПОКАЗАТЕЛЬ", "ФОНД", "ПРОГРЕСС", "СТАТУС", "ДЕТАЛИ");
+    println!("{}", "-".repeat(108));
+    for indicator in &summary.indicators {
+        let progress = indicator
+            .progress_percent
+            .map(|value| format!("{value:>6.1}%"))
+            .unwrap_or_else(|| "     — ".into());
+        println!(
+            "{:<29} {:>8}₽ {:>10} {:<18} {}",
+            truncate(indicator.kind.label(), 29),
+            indicator.payout_rub,
+            progress,
+            indicator.status.label(),
+            truncate(&indicator.detail, 44)
+        );
+    }
+
+    println!();
+    println!(
+        "Bitrix: открыто {} · просрочено {} · закрыто в периоде {} · task-привязок KPI {}",
+        summary.open_now,
+        summary.overdue_open_now,
+        summary.completed_in_period,
+        summary.plan_task_links
+    );
+    println!(
+        "Примечание: прогресс задачи по чеклисту/статусу — operational proxy. Финальная оценка идёт по рабочим артефактам и правилам регламента."
+    );
+}
+
+pub fn print_plan(period: &Period, plan: &PeriodPlan, config: &KpiConfig) {
+    println!("План KPI {} · {}", period.label(), config.profile_label());
+    println!("{}", "=".repeat(72));
+    for kind in KPI_KINDS {
+        println!("{} · {} ₽", kind.label(), kind.payout_rub());
+        if kind.supports_task_links() {
+            let links: Vec<_> = plan.tasks.iter().filter(|task| task.kind == kind).collect();
+            if links.is_empty() {
+                println!("  — задач не привязано");
+            } else {
+                for link in links {
+                    println!("  #{} · weight {:.2}", link.task_id, link.weight);
+                }
+            }
+        } else if let Some(evidence) = plan.evidence.get(kind) {
+            println!("  {}{}", evidence.state.label(), evidence.note.as_deref().map(|n| format!(" · {n}")).unwrap_or_default());
+        }
+    }
+}
+
+pub fn status_label(task: &Task, now: chrono::DateTime<Utc>) -> &'static str {
+    if task.is_closed() {
+        "done"
+    } else if task
+        .deadline
+        .as_deref()
+        .and_then(kpi::parse_datetime)
+        .is_some_and(|deadline| deadline < now)
+    {
+        "OVERDUE"
+    } else {
+        match task.status.as_str() {
+            "2" => "waiting",
+            "3" => "doing",
+            "4" => "control",
+            "6" => "deferred",
+            _ => "open",
+        }
+    }
+}
+
+pub fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}…",
+            head.chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        head
+    }
+}
+
+pub fn print_ai_analysis(analysis: &crate::ai::AiAnalysis) {
+    println!(
+        "AI KPI {} · {} → {}",
+        analysis.period, analysis.requested_model, analysis.model_used
+    );
+    println!("{}", "=".repeat(104));
+    println!("Статус: {}", analysis.result.overall_status);
+
+    let legacy = analysis.result.estimated_payout_rub.unwrap_or(0);
+    let confirmed = analysis.result.confirmed_payout_rub.unwrap_or(legacy);
+    let likely = analysis.result.likely_payout_rub.unwrap_or(confirmed);
+    let potential = analysis.result.potential_payout_rub.unwrap_or(170_000);
+    println!("Формально подтверждено: {:>6} ₽ / 170000 ₽", confirmed);
+    println!("Вероятно закрыто:       {:>6} ₽ / 170000 ₽", likely);
+    println!("Потенциал периода:      {:>6} ₽ / 170000 ₽", potential);
+    println!(
+        "{}",
+        crate::ai::humanize_task_refs(analysis, &analysis.result.executive_summary)
+    );
+
+    if let Some(usage) = &analysis.usage {
+        let tokens = usage
+            .total_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "—".into());
+        let cost = usage
+            .cost
+            .map(|value| format!("${value:.6}"))
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "Модель: {} · tokens {} · cost {} · JSON mode {}",
+            analysis.model_used,
+            tokens,
+            cost,
+            if analysis.json_mode { "yes" } else { "fallback" }
+        );
+    }
+
+    println!();
+    println!(
+        "{:<14} {:<18} {:<10} {:>9} {:>8} {}",
+        "KPI", "AI STATUS", "EVIDENCE", "PROGRESS", "CONF", "ОБОСНОВАНИЕ"
+    );
+    println!("{}", "-".repeat(122));
+    for indicator in &analysis.result.indicators {
+        let progress = indicator
+            .progress_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let rationale = crate::ai::humanize_task_refs(analysis, &indicator.rationale);
+        println!(
+            "{:<14} {:<18} {:<10} {:>9} {:>7.0}% {}",
+            truncate(&indicator.kind, 14),
+            truncate(&indicator.status, 18),
+            truncate(&indicator.evidence_level, 10),
+            progress,
+            indicator.confidence * 100.0,
+            truncate(&rationale, 52)
+        );
+        for evidence in indicator.evidence.iter().take(1) {
+            let evidence = crate::ai::humanize_task_refs(analysis, evidence);
+            println!("  evidence: {}", truncate(&evidence, 102));
+        }
+        for gap in indicator.gaps.iter().take(2) {
+            let gap = crate::ai::humanize_task_refs(analysis, gap);
+            println!("  gap: {}", truncate(&gap, 107));
+        }
+    }
+
+    if !analysis.result.risks.is_empty() {
+        println!("\nРиски:");
+        for risk in analysis.result.risks.iter().take(8) {
+            println!(
+                "  • {}",
+                crate::ai::humanize_task_refs(analysis, risk)
+            );
+        }
+    }
+    if !analysis.result.next_actions.is_empty() {
+        println!("\nСледующие действия:");
+        for action in analysis.result.next_actions.iter().take(8) {
+            println!(
+                "  • {}",
+                crate::ai::humanize_task_refs(analysis, action)
+            );
+        }
+    }
+    if !analysis.result.questions.is_empty() {
+        println!("\nЧто уточнить:");
+        for question in analysis.result.questions.iter().take(8) {
+            println!(
+                "  • {}",
+                crate::ai::humanize_task_refs(analysis, question)
+            );
+        }
+    }
+}
+
+pub fn print_ai_plan_suggestions(analysis: &crate::ai::AiAnalysis, min_confidence: f64) {
+    println!(
+        "AI-предложения по KPI-плану {} · threshold {:.0}%",
+        analysis.period,
+        min_confidence * 100.0
+    );
+    println!("{}", "=".repeat(96));
+
+    let candidates = crate::ai::plan_candidates(analysis, min_confidence);
+    if candidates.is_empty() {
+        println!("Нет предложений выше заданного confidence.");
+        return;
+    }
+
+    for candidate in candidates {
+        let title = crate::ai::display_task_title(analysis, &candidate.task_id);
+        println!("«{}»", truncate(&title, 88));
+        println!(
+            "  → {} · weight {:.2} · confidence {:.0}%",
+            candidate.kind.label(),
+            candidate.weight,
+            candidate.confidence * 100.0
+        );
+        let reason = crate::ai::humanize_task_refs(analysis, &candidate.reason);
+        println!("  {}", truncate(&reason, 92));
+        println!();
+    }
+}

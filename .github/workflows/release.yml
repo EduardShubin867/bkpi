@@ -1,0 +1,92 @@
+name: Release runtime
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Linux credential store dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo build --release --locked --features standalone-ai --target ${{ matrix.target }}
+      - name: Package binary and checksum
+        shell: python
+        env:
+          BKPI_TARGET: ${{ matrix.target }}
+        run: |
+          import hashlib, os, pathlib, shutil, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          ref = os.environ['GITHUB_REF']
+          if ref.startswith('refs/tags/') and ref != 'refs/tags/v' + version:
+              raise SystemExit('Tag does not match Cargo version')
+          target = os.environ['BKPI_TARGET']
+          extension = '.exe' if 'windows' in target else ''
+          out = pathlib.Path('release-assets')
+          out.mkdir()
+          dest = out / f'bkpi-v{version}-{target}{extension}'
+          shutil.copy2(f'target/{target}/release/bkpi{extension}', dest)
+          pathlib.Path(str(dest) + '.sha256').write_text(hashlib.sha256(dest.read_bytes()).hexdigest() + '  ' + dest.name + '\n')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.target }}
+          path: release-assets/*
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: installer/package-lock.json
+      - run: npm ci
+        working-directory: installer
+      - run: npm run typecheck && npm run lint && npm run build && npm test && npm pack
+        working-directory: installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: installer/*.tgz
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create draft GitHub release (never publishes npm)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --draft --title "$GITHUB_REF_NAME" --generate-notes

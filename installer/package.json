@@ -1,0 +1,40 @@
+{
+  "name": "bkpi",
+  "version": "0.6.0",
+  "description": "Install the local BKPI Rust runtime and coding-agent integrations",
+  "type": "module",
+  "bin": {
+    "bkpi": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "bundles",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "test": "tsx --test test/*.test.ts",
+    "build": "tsc && node scripts/bundle.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.0.0",
+    "cross-spawn": "^7.0.6"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^22.0.0",
+    "eslint": "^10.10.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.0.0"
+  },
+  "bkpi": {
+    "releaseRepository": ""
+  }
+}

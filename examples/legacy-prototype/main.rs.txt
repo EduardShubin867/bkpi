@@ -1,0 +1,508 @@
+mod ai;
+mod bitrix;
+mod cli;
+mod config;
+mod kpi;
+mod output;
+mod tui;
+
+use std::io::{self, Write};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+
+use crate::ai::{AiAnalysis, OpenRouterClient};
+use crate::bitrix::BitrixClient;
+use crate::cli::{AiCommand, Cli, Command, ConfigCommand, EvidenceCommand, PlanCommand};
+use crate::config::{Config, EvidenceState, KpiKind, TrackedTask};
+use crate::kpi::Period;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        None | Some(Command::Tui) => {
+            let config = Config::load()?;
+            let client = BitrixClient::new(&config.bitrix.webhook_url)?;
+            tui::run(client, config).await?;
+        }
+        Some(Command::Init { webhook }) => {
+            let mut config = Config::default();
+            config.set_webhook(&webhook)?;
+            config.save()?;
+            println!("Конфиг сохранён: {}", Config::path()?.display());
+            println!("Профиль KPI: {}", config.kpi.profile_label());
+            println!("Максимальный фонд: {} ₽", config.kpi.max_payout_rub());
+            println!("OpenRouter можно добавить позже: bkpi ai setup");
+        }
+        Some(Command::Config { command }) => handle_config(command)?,
+        Some(Command::Plan { command }) => handle_plan(command)?,
+        Some(Command::Evidence { command }) => handle_evidence(command)?,
+        Some(Command::Ai { command }) => handle_ai(command).await?,
+        Some(Command::Doctor) => {
+            let config = Config::load()?;
+            let client = BitrixClient::new(&config.bitrix.webhook_url)?;
+            let user = client.current_user().await?;
+            println!("✓ Bitrix доступен");
+            println!("✓ Пользователь: {} (ID {})", user.display_name(), user.id);
+            println!("✓ Конфиг: {}", Config::path()?.display());
+            println!("✓ KPI-профиль: {}", config.kpi.profile_label());
+
+            let tasks = client.tasks_for_user(&user.id).await?;
+            println!("✓ Доступ к задачам: {} получено", tasks.len());
+            if config.openrouter.configured() {
+                println!(
+                    "✓ OpenRouter настроен: {} ({}) — проверить: bkpi ai doctor",
+                    config.openrouter.model,
+                    config.redacted_openrouter_key()
+                );
+            } else {
+                println!("• OpenRouter не настроен — bkpi ai setup");
+            }
+        }
+        Some(Command::Tasks(args)) => {
+            let config = Config::load()?;
+            let client = BitrixClient::new(&config.bitrix.webhook_url)?;
+            let user = client.current_user().await?;
+            let tasks = client.tasks_for_user(&user.id).await?;
+            let checklists = client.checklist_progress_for_open_tasks(&tasks).await;
+            output::print_tasks(&tasks, &args, &checklists);
+        }
+        Some(Command::Kpi { month }) => {
+            let config = Config::load()?;
+            let client = BitrixClient::new(&config.bitrix.webhook_url)?;
+            let user = client.current_user().await?;
+            let tasks = client.tasks_for_user(&user.id).await?;
+            let checklists = client.checklist_progress_for_open_tasks(&tasks).await;
+            let period = Period::parse_or_current(month.as_deref())?;
+            let summary = kpi::calculate(&tasks, &period, &config.kpi, &checklists);
+            output::print_kpi(&user, &period, &summary, &config.kpi);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_config(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Path => println!("{}", Config::path()?.display()),
+        ConfigCommand::Show => {
+            let config = Config::load()?;
+            println!("config = {}", Config::path()?.display());
+            println!("webhook = {}", config.redacted_webhook());
+            println!("profile = {}", config.kpi.profile_label());
+            println!("result_threshold_percent = {:.1}", config.kpi.result_threshold_percent);
+            println!("max_payout_rub = {}", config.kpi.max_payout_rub());
+            println!("configured_periods = {}", config.kpi.plans.len());
+            println!("openrouter_key = {}", config.redacted_openrouter_key());
+            println!("openrouter_model = {}", config.openrouter.model);
+            println!("openrouter_zdr = {}", config.openrouter.zdr);
+            println!(
+                "openrouter_deny_data_collection = {}",
+                config.openrouter.deny_data_collection
+            );
+            println!(
+                "openrouter_include_descriptions = {}",
+                config.openrouter.include_descriptions
+            );
+            println!("openrouter_max_tasks = {}", config.openrouter.max_tasks);
+        }
+        ConfigCommand::SetWebhook { webhook } => {
+            let mut config = Config::load_or_default()?;
+            config.set_webhook(&webhook)?;
+            config.save()?;
+            println!("Webhook сохранён в {}", Config::path()?.display());
+        }
+    }
+    Ok(())
+}
+
+async fn handle_ai(command: AiCommand) -> Result<()> {
+    match command {
+        AiCommand::Setup { model } => {
+            let mut config = Config::load()?;
+            let key = rpassword::prompt_password("OpenRouter API key: ")
+                .context("Не удалось прочитать OpenRouter API key")?;
+            config.set_openrouter_key(&key)?;
+            if let Some(model) = model {
+                config.set_openrouter_model(&model)?;
+            }
+            config.save()?;
+            println!("✓ OpenRouter key сохранён в {} (0600)", Config::path()?.display());
+            println!("✓ model = {}", config.openrouter.model);
+            println!(
+                "✓ privacy: ZDR={} · deny_data_collection={} · descriptions={}",
+                config.openrouter.zdr,
+                config.openrouter.deny_data_collection,
+                config.openrouter.include_descriptions
+            );
+
+            let client = OpenRouterClient::new(&config.openrouter)?;
+            match client.key_info().await {
+                Ok(info) => println!("✓ API key работает: {}", ai::format_key_info(&info)),
+                Err(error) => println!("⚠ Ключ сохранён, но проверка не прошла: {error:#}"),
+            }
+        }
+        AiCommand::Model { model } => {
+            let mut config = Config::load()?;
+            config.set_openrouter_model(&model)?;
+            config.save()?;
+            println!("OpenRouter model = {}", config.openrouter.model);
+        }
+        AiCommand::Privacy {
+            zdr,
+            deny_data_collection,
+            descriptions,
+        } => {
+            let mut config = Config::load()?;
+            let changed = zdr.is_some() || deny_data_collection.is_some() || descriptions.is_some();
+            if let Some(value) = zdr {
+                config.openrouter.zdr = value;
+            }
+            if let Some(value) = deny_data_collection {
+                config.openrouter.deny_data_collection = value;
+            }
+            if let Some(value) = descriptions {
+                config.openrouter.include_descriptions = value;
+            }
+            if changed {
+                config.save()?;
+            }
+            println!("OpenRouter privacy:");
+            println!("  zdr = {}", config.openrouter.zdr);
+            println!(
+                "  deny_data_collection = {}",
+                config.openrouter.deny_data_collection
+            );
+            println!(
+                "  include_descriptions = {}",
+                config.openrouter.include_descriptions
+            );
+            println!("  max_tasks = {}", config.openrouter.max_tasks);
+            println!(
+                "  max_description_chars = {}",
+                config.openrouter.max_description_chars
+            );
+        }
+        AiCommand::Doctor => {
+            let config = Config::load()?;
+            let client = OpenRouterClient::new(&config.openrouter)?;
+            let info = client.key_info().await?;
+            println!("✓ OpenRouter API key работает");
+            println!("✓ {}", ai::format_key_info(&info));
+            println!("✓ model = {}", config.openrouter.model);
+            println!(
+                "✓ request privacy: ZDR={} · deny_data_collection={}",
+                config.openrouter.zdr, config.openrouter.deny_data_collection
+            );
+        }
+        AiCommand::Analyze { month, model } => {
+            let config = Config::load()?;
+            let period = Period::parse_or_current(month.as_deref())?;
+            let analysis = run_ai_analysis(&config, &period, model.as_deref()).await?;
+            let path = ai::save_analysis(&analysis)?;
+            output::print_ai_analysis(&analysis);
+            println!("\nКэш: {}", path.display());
+        }
+        AiCommand::Show { month } => {
+            let period = Period::parse_or_current(month.as_deref())?;
+            let analysis = ai::load_analysis(&period.label())?.with_context(|| {
+                format!(
+                    "Нет AI-анализа за {}. Сначала выполни: bkpi ai analyze --month {}",
+                    period.label(),
+                    period.label()
+                )
+            })?;
+            output::print_ai_analysis(&analysis);
+        }
+        AiCommand::Plan {
+            month,
+            apply,
+            dry_run,
+            min_confidence,
+        } => {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&min_confidence),
+                "min-confidence должен быть от 0 до 1"
+            );
+            let period = Period::parse_or_current(month.as_deref())?;
+            let analysis = ai::load_analysis(&period.label())?.with_context(|| {
+                format!(
+                    "Нет AI-анализа за {}. Сначала выполни: bkpi ai analyze --month {}",
+                    period.label(),
+                    period.label()
+                )
+            })?;
+            output::print_ai_plan_suggestions(&analysis, min_confidence);
+            let candidates = ai::plan_candidates(&analysis, min_confidence);
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            if dry_run {
+                println!("Это dry-run: KPI-план не изменён.");
+                return Ok(());
+            }
+
+            let selected = if apply {
+                candidates
+            } else {
+                prompt_plan_candidates(&analysis, candidates)?
+            };
+            if selected.is_empty() {
+                println!("Ничего не выбрано — KPI-план не изменён.");
+                return Ok(());
+            }
+
+            let mut config = Config::load()?;
+            let bitrix = BitrixClient::new(&config.bitrix.webhook_url)?;
+            let user = bitrix.current_user().await?;
+            let tasks = bitrix.tasks_for_user(&user.id).await?;
+            let actions = ai::apply_plan_candidates(&mut config, &period, &selected, &tasks)?;
+            if actions.is_empty() {
+                println!("Нечего применять.");
+            } else {
+                config.save()?;
+                println!("Применено в локальный KPI-план:");
+                for action in actions {
+                    println!("  ✓ {action}");
+                }
+            }
+        }
+        AiCommand::Clear { month } => {
+            let period = Period::parse_or_current(month.as_deref())?;
+            if ai::clear_analysis(&period.label())? {
+                println!("AI-кэш {} удалён", period.label());
+            } else {
+                println!("AI-кэша {} нет", period.label());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn prompt_plan_candidates(
+    analysis: &AiAnalysis,
+    candidates: Vec<ai::AiPlanCandidate>,
+) -> Result<Vec<ai::AiPlanCandidate>> {
+    println!("Интерактивное подтверждение. y = применить, n/Enter = пропустить, q = закончить.\n");
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        let title = ai::display_task_title(analysis, &candidate.task_id);
+        println!("«{}»", title);
+        println!(
+            "  {} · confidence {:.0}% · weight {:.2}",
+            candidate.kind.label(),
+            candidate.confidence * 100.0,
+            candidate.weight
+        );
+        if !candidate.reason.trim().is_empty() {
+            println!(
+                "  {}",
+                ai::humanize_task_refs(analysis, &candidate.reason)
+            );
+        }
+        print!("  Применить к этому KPI? [y/N/q] ");
+        io::stdout().flush().context("Не удалось вывести prompt")?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .context("Не удалось прочитать ответ")?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" | "д" | "да" => {
+                selected.push(candidate);
+                println!("  ✓ выбрано\n");
+            }
+            "q" | "quit" | "й" => {
+                println!("  Остановлено пользователем.\n");
+                break;
+            }
+            _ => println!("  — пропущено\n"),
+        }
+    }
+    Ok(selected)
+}
+
+async fn run_ai_analysis(
+    config: &Config,
+    period: &Period,
+    model_override: Option<&str>,
+) -> Result<AiAnalysis> {
+    let bitrix = BitrixClient::new(&config.bitrix.webhook_url)?;
+    let user = bitrix.current_user().await?;
+    let tasks = bitrix.tasks_for_user(&user.id).await?;
+    let selected_count = ai::select_tasks_for_ai(
+        &tasks,
+        period,
+        &config.kpi,
+        config.openrouter.max_tasks,
+    )
+    .len();
+
+    println!(
+        "AI snapshot {}: {} задач из {} · descriptions={} · ZDR={} · deny_data_collection={}",
+        period.label(),
+        selected_count,
+        tasks.len(),
+        config.openrouter.include_descriptions,
+        config.openrouter.zdr,
+        config.openrouter.deny_data_collection
+    );
+    println!(
+        "Отправляю snapshot в OpenRouter через {}…",
+        model_override.unwrap_or(config.openrouter.model.as_str())
+    );
+
+    ai::run_analysis(&bitrix, config, &user, &tasks, period, model_override).await
+}
+
+fn handle_plan(command: PlanCommand) -> Result<()> {
+    let mut config = Config::load()?;
+
+    match command {
+        PlanCommand::Add {
+            kind,
+            task_id,
+            weight,
+            month,
+        } => {
+            anyhow::ensure!(
+                kind.supports_task_links(),
+                "Для {} используй bkpi evidence, а не plan add",
+                kind.label()
+            );
+            anyhow::ensure!(weight > 0.0, "Вес должен быть > 0");
+            let period = Period::parse_or_current(month.as_deref())?;
+            let month_key = period.label();
+            let plan = config.kpi.plan_mut(&month_key);
+
+            if kind == KpiKind::Result {
+                let existing = plan
+                    .tasks
+                    .iter()
+                    .filter(|item| item.kind == KpiKind::Result && item.task_id != task_id)
+                    .count();
+                anyhow::ensure!(
+                    existing < 3,
+                    "По регламенту в согласованном результате фиксируется 1–3 ключевых результата"
+                );
+            }
+
+            if let Some(item) = plan
+                .tasks
+                .iter_mut()
+                .find(|item| item.kind == kind && item.task_id == task_id)
+            {
+                item.weight = weight;
+                println!(
+                    "Обновлена привязка #{} → {} (weight {:.2})",
+                    task_id,
+                    kind.label(),
+                    weight
+                );
+            } else {
+                plan.tasks.push(TrackedTask {
+                    task_id: task_id.clone(),
+                    kind,
+                    weight,
+                });
+                println!(
+                    "Добавлено #{} → {} (weight {:.2})",
+                    task_id,
+                    kind.label(),
+                    weight
+                );
+            }
+            config.save()?;
+            println!("Период: {}", month_key);
+        }
+        PlanCommand::Remove {
+            kind,
+            task_id,
+            month,
+        } => {
+            let period = Period::parse_or_current(month.as_deref())?;
+            let month_key = period.label();
+            let plan = config.kpi.plan_mut(&month_key);
+            let before = plan.tasks.len();
+            plan.tasks
+                .retain(|item| !(item.kind == kind && item.task_id == task_id));
+            let after = plan.tasks.len();
+            config.save()?;
+            if before == after {
+                println!("Привязка не найдена");
+            } else {
+                println!("Удалено #{} из {} ({})", task_id, kind.label(), month_key);
+            }
+        }
+        PlanCommand::List { month } => {
+            let period = Period::parse_or_current(month.as_deref())?;
+            let plan = config.kpi.plan(&period.label());
+            output::print_plan(&period, &plan, &config.kpi);
+        }
+        PlanCommand::Clear { kind, month } => {
+            let period = Period::parse_or_current(month.as_deref())?;
+            let month_key = period.label();
+            let plan = config.kpi.plan_mut(&month_key);
+            match kind {
+                Some(kind) => plan.tasks.retain(|item| item.kind != kind),
+                None => plan.tasks.clear(),
+            }
+            config.save()?;
+            println!("Task-привязки очищены для {}", month_key);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_evidence(command: EvidenceCommand) -> Result<()> {
+    let mut config = Config::load()?;
+
+    match command {
+        EvidenceCommand::Set {
+            kind,
+            state,
+            note,
+            month,
+        } => {
+            anyhow::ensure!(
+                kind.supports_manual_evidence(),
+                "Ручной evidence сейчас поддержан только для quality и knowledge"
+            );
+            let period = Period::parse_or_current(month.as_deref())?;
+            let month_key = period.label();
+            let evidence = config
+                .kpi
+                .plan_mut(&month_key)
+                .evidence
+                .get_mut(kind)
+                .expect("manual evidence slot");
+            evidence.state = state;
+            evidence.note = note;
+            config.save()?;
+            println!("{}: {} ({})", kind.label(), state.label(), month_key);
+        }
+        EvidenceCommand::Clear { kind, month } => {
+            anyhow::ensure!(
+                kind.supports_manual_evidence(),
+                "Ручной evidence сейчас поддержан только для quality и knowledge"
+            );
+            let period = Period::parse_or_current(month.as_deref())?;
+            let month_key = period.label();
+            let evidence = config
+                .kpi
+                .plan_mut(&month_key)
+                .evidence
+                .get_mut(kind)
+                .expect("manual evidence slot");
+            evidence.state = EvidenceState::Pending;
+            evidence.note = None;
+            config.save()?;
+            println!("{} сброшено в pending ({})", kind.label(), month_key);
+        }
+    }
+
+    Ok(())
+}

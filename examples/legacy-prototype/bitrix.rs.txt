@@ -1,0 +1,344 @@
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+#[derive(Debug, Clone)]
+pub struct BitrixClient {
+    http: Client,
+    webhook_base: String,
+}
+
+impl BitrixClient {
+    pub fn new(webhook_base: &str) -> Result<Self> {
+        let webhook_base = webhook_base.trim().trim_end_matches('/').to_string();
+        anyhow::ensure!(!webhook_base.is_empty(), "Webhook URL пуст");
+        Ok(Self {
+            http: Client::builder()
+                .user_agent(concat!("bkpi/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .context("Не удалось создать HTTP client")?,
+            webhook_base,
+        })
+    }
+
+    async fn call<T: DeserializeOwned>(&self, method: &str, body: Value) -> Result<T> {
+        let url = format!("{}/{}", self.webhook_base, method);
+        let response = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Ошибка запроса Bitrix: {method}"))?;
+
+        let status = response.status();
+        let bytes = response.bytes().await.context("Не удалось прочитать ответ Bitrix")?;
+        let payload: ApiEnvelope<T> = serde_json::from_slice(&bytes).with_context(|| {
+            let text = String::from_utf8_lossy(&bytes);
+            format!("Bitrix вернул неожиданный ответ (HTTP {status}): {}", truncate(&text, 300))
+        })?;
+
+        if let Some(error) = payload.error {
+            let description = payload.error_description.unwrap_or_default();
+            anyhow::bail!("Bitrix API: {error}: {description}");
+        }
+
+        payload.result.context("В ответе Bitrix отсутствует result")
+    }
+
+    pub async fn current_user(&self) -> Result<User> {
+        self.call("user.current", json!({})).await
+    }
+
+    pub async fn tasks_for_user(&self, user_id: &str) -> Result<Vec<Task>> {
+        let mut all = Vec::new();
+        let mut start = 0usize;
+
+        loop {
+            let result: TaskListResult = self
+                .call(
+                    "tasks.task.list",
+                    json!({
+                        "order": { "DEADLINE": "asc", "ID": "desc" },
+                        "filter": { "RESPONSIBLE_ID": user_id },
+                        "select": [
+                            "ID", "TITLE", "STATUS", "REAL_STATUS", "PRIORITY",
+                            "DEADLINE", "CREATED_DATE", "CHANGED_DATE", "CLOSED_DATE",
+                            "RESPONSIBLE_ID", "DESCRIPTION"
+                        ],
+                        "start": start
+                    }),
+                )
+                .await?;
+
+            let page_len = result.tasks.len();
+            all.extend(result.tasks);
+            if page_len < 50 {
+                break;
+            }
+            start += 50;
+        }
+
+        Ok(all)
+    }
+
+    pub async fn checklist_for_task(&self, task_id: &str) -> Result<Vec<ChecklistItem>> {
+        let mut all = Vec::new();
+        let mut start = 0usize;
+
+        loop {
+            let page: Vec<ChecklistItem> = self
+                .call(
+                    "task.checklistitem.getlist",
+                    json!({
+                        "TASKID": task_id,
+                        "ORDER": { "SORT_INDEX": "asc" },
+                        "start": start
+                    }),
+                )
+                .await?;
+
+            let page_len = page.len();
+            all.extend(page);
+            if page_len < 50 {
+                break;
+            }
+            start += 50;
+        }
+
+        Ok(all)
+    }
+
+    /// Получить содержимое чеклистов только для выбранного набора задач.
+    /// Используется AI snapshot, чтобы не делать запрос по каждой задаче во всём Bitrix.
+    pub async fn checklists_for_tasks(
+        &self,
+        tasks: &[&Task],
+    ) -> HashMap<String, Vec<ChecklistItem>> {
+        let mut result = HashMap::new();
+        for task in tasks {
+            let Ok(items) = self.checklist_for_task(&task.id).await else {
+                continue;
+            };
+            if !items.is_empty() {
+                result.insert(task.id.clone(), items);
+            }
+        }
+        result
+    }
+
+    pub async fn results_for_task(&self, task_id: &str) -> Result<Vec<TaskResult>> {
+        let mut all = Vec::new();
+        let mut start = 0usize;
+
+        loop {
+            let page: Vec<TaskResult> = self
+                .call(
+                    "tasks.task.result.list",
+                    json!({
+                        "taskId": task_id,
+                        "start": start
+                    }),
+                )
+                .await?;
+
+            let page_len = page.len();
+            all.extend(page);
+            if page_len < 50 {
+                break;
+            }
+            start += 50;
+        }
+
+        Ok(all)
+    }
+
+    /// Результаты задачи — сильный evidence для AI. Ошибка на одной задаче не
+    /// должна ломать весь анализ: такие задачи просто останутся без results.
+    pub async fn results_for_tasks(
+        &self,
+        tasks: &[&Task],
+    ) -> HashMap<String, Vec<TaskResult>> {
+        let mut result = HashMap::new();
+        for task in tasks {
+            let Ok(items) = self.results_for_task(&task.id).await else {
+                continue;
+            };
+            if !items.is_empty() {
+                result.insert(task.id.clone(), items);
+            }
+        }
+        result
+    }
+
+    /// Чеклисты — вспомогательный источник прогресса. Если конкретная задача
+    /// не отдаёт чеклист, dashboard не должен падать: для неё будет fallback по статусу.
+    pub async fn checklist_progress_for_open_tasks(
+        &self,
+        tasks: &[Task],
+    ) -> HashMap<String, ChecklistProgress> {
+        let mut result = HashMap::new();
+
+        for task in tasks.iter().filter(|task| !task.is_closed()) {
+            let Ok(items) = self.checklist_for_task(&task.id).await else {
+                continue;
+            };
+            let progress = ChecklistProgress::from_items(&items);
+            if progress.total > 0 {
+                result.insert(task.id.clone(), progress);
+            }
+        }
+
+        result
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEnvelope<T> {
+    result: Option<T>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct User {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "NAME", default)]
+    pub name: String,
+    #[serde(rename = "LAST_NAME", default)]
+    pub last_name: String,
+    #[serde(rename = "EMAIL", default)]
+    pub email: String,
+}
+
+impl User {
+    pub fn display_name(&self) -> String {
+        let name = format!("{} {}", self.name, self.last_name).trim().to_string();
+        if !name.is_empty() {
+            name
+        } else if !self.email.is_empty() {
+            self.email.clone()
+        } else {
+            format!("user {}", self.id)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskListResult {
+    tasks: Vec<Task>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub created_date: Option<String>,
+    #[serde(default)]
+    pub changed_date: Option<String>,
+    #[serde(default)]
+    pub closed_date: Option<String>,
+    #[serde(default)]
+    pub responsible_id: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl Task {
+    pub fn is_closed(&self) -> bool {
+        self.status == "5" || self.closed_date.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResult {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub formatted_text: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub status: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChecklistItem {
+    #[serde(rename = "ID", default)]
+    pub id: String,
+    #[serde(rename = "TITLE", default)]
+    pub title: String,
+    #[serde(rename = "PARENT_ID", default)]
+    pub parent_id: Value,
+    #[serde(rename = "IS_COMPLETE", default)]
+    pub is_complete: Value,
+}
+
+impl ChecklistItem {
+    pub fn is_root(&self) -> bool {
+        match &self.parent_id {
+            Value::String(value) => value == "0" || value.is_empty(),
+            Value::Number(value) => value.as_i64() == Some(0),
+            Value::Null => true,
+            _ => false,
+        }
+    }
+
+    pub fn completed(&self) -> bool {
+        match &self.is_complete {
+            Value::String(value) => value.eq_ignore_ascii_case("Y") || value == "1" || value.eq_ignore_ascii_case("true"),
+            Value::Bool(value) => *value,
+            Value::Number(value) => value.as_i64().is_some_and(|v| v != 0),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChecklistProgress {
+    pub completed: usize,
+    pub total: usize,
+}
+
+impl ChecklistProgress {
+    pub fn from_items(items: &[ChecklistItem]) -> Self {
+        let mut progress = Self::default();
+        for item in items.iter().filter(|item| !item.is_root()) {
+            progress.total += 1;
+            if item.completed() {
+                progress.completed += 1;
+            }
+        }
+        progress
+    }
+
+    pub fn percent(&self) -> Option<f64> {
+        (self.total > 0).then(|| self.completed as f64 / self.total as f64 * 100.0)
+    }
+}

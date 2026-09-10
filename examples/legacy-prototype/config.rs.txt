@@ -1,0 +1,449 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub bitrix: BitrixConfig,
+    #[serde(default)]
+    pub kpi: KpiConfig,
+    #[serde(default)]
+    pub openrouter: OpenRouterConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BitrixConfig {
+    pub webhook_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenRouterConfig {
+    /// Хранится в config.toml с правами 0600. В CLI никогда не печатается полностью.
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Можно использовать конкретный slug или router, например openrouter/auto.
+    #[serde(default = "default_openrouter_model")]
+    pub model: String,
+
+    /// Для рабочих данных безопаснее по умолчанию требовать Zero Data Retention.
+    #[serde(default = "default_true")]
+    pub zdr: bool,
+
+    /// Запрещаем провайдеров, которые собирают/обучаются на входных данных.
+    #[serde(default = "default_true")]
+    pub deny_data_collection: bool,
+
+    /// Описания задач сильно улучшают классификацию, но могут содержать внутренние данные.
+    #[serde(default = "default_true")]
+    pub include_descriptions: bool,
+
+    /// Ограничение размера snapshot, чтобы случайно не отправить в модель весь Bitrix.
+    #[serde(default = "default_ai_max_tasks")]
+    pub max_tasks: usize,
+
+    /// Обрезаем очень большие описания задач до разумного размера.
+    #[serde(default = "default_ai_description_chars")]
+    pub max_description_chars: usize,
+}
+
+fn default_openrouter_model() -> String {
+    "openrouter/auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ai_max_tasks() -> usize {
+    40
+}
+
+fn default_ai_description_chars() -> usize {
+    4_000
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: default_openrouter_model(),
+            zdr: true,
+            deny_data_collection: true,
+            include_descriptions: true,
+            max_tasks: default_ai_max_tasks(),
+            max_description_chars: default_ai_description_chars(),
+        }
+    }
+}
+
+impl OpenRouterConfig {
+    pub fn configured(&self) -> bool {
+        !self.api_key.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.model.trim().is_empty(), "OpenRouter model не может быть пустым");
+        anyhow::ensure!(
+            (1..=200).contains(&self.max_tasks),
+            "openrouter.max_tasks должен быть от 1 до 200"
+        );
+        anyhow::ensure!(
+            (256..=100_000).contains(&self.max_description_chars),
+            "openrouter.max_description_chars должен быть от 256 до 100000"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
+pub enum KpiKind {
+    #[value(alias = "delivery")]
+    Result,
+    Initiative,
+    Improvement,
+    Quality,
+    Knowledge,
+}
+
+impl KpiKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Result => "Согласованный результат",
+            Self::Initiative => "Ведение инициативы",
+            Self::Improvement => "Автоматизация / улучшения",
+            Self::Quality => "Качество изменений",
+            Self::Knowledge => "Прозрачность и знания",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Result => "result",
+            Self::Initiative => "initiative",
+            Self::Improvement => "improvement",
+            Self::Quality => "quality",
+            Self::Knowledge => "knowledge",
+        }
+    }
+
+    pub fn payout_rub(self) -> u32 {
+        match self {
+            Self::Result => 40_000,
+            Self::Initiative => 50_000,
+            Self::Improvement => 20_000,
+            Self::Quality => 20_000,
+            Self::Knowledge => 40_000,
+        }
+    }
+
+    pub fn supports_task_links(self) -> bool {
+        matches!(self, Self::Result | Self::Initiative | Self::Improvement)
+    }
+
+    pub fn supports_manual_evidence(self) -> bool {
+        matches!(self, Self::Quality | Self::Knowledge)
+    }
+}
+
+pub const KPI_KINDS: [KpiKind; 5] = [
+    KpiKind::Result,
+    KpiKind::Initiative,
+    KpiKind::Improvement,
+    KpiKind::Quality,
+    KpiKind::Knowledge,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
+pub enum EvidenceState {
+    #[default]
+    Pending,
+    Met,
+    Failed,
+    Blocked,
+}
+
+impl EvidenceState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "ожидает подтверждения",
+            Self::Met => "подтверждено",
+            Self::Failed => "не выполнено",
+            Self::Blocked => "внешняя блокировка",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedTask {
+    pub task_id: String,
+    pub kind: KpiKind,
+    #[serde(default = "default_task_weight")]
+    pub weight: f64,
+}
+
+fn default_task_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManualEvidence {
+    #[serde(default)]
+    pub state: EvidenceState,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceConfig {
+    #[serde(default)]
+    pub quality: ManualEvidence,
+    #[serde(default)]
+    pub knowledge: ManualEvidence,
+}
+
+impl EvidenceConfig {
+    pub fn get(&self, kind: KpiKind) -> Option<&ManualEvidence> {
+        match kind {
+            KpiKind::Quality => Some(&self.quality),
+            KpiKind::Knowledge => Some(&self.knowledge),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, kind: KpiKind) -> Option<&mut ManualEvidence> {
+        match kind {
+            KpiKind::Quality => Some(&mut self.quality),
+            KpiKind::Knowledge => Some(&mut self.knowledge),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PeriodPlan {
+    #[serde(default)]
+    pub tasks: Vec<TrackedTask>,
+    #[serde(default)]
+    pub evidence: EvidenceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KpiConfig {
+    /// Профиль из регламента: «Наставничество и Senior».
+    #[serde(default = "default_profile")]
+    pub profile: String,
+
+    /// Порог для «Согласованного результата» в обычных профилях.
+    #[serde(default = "default_result_threshold")]
+    pub result_threshold_percent: f64,
+
+    /// Планы привязаны к месяцу, потому что цели должны фиксироваться на период заранее.
+    #[serde(default)]
+    pub plans: BTreeMap<String, PeriodPlan>,
+}
+
+fn default_profile() -> String {
+    "mentor_senior".to_string()
+}
+
+fn default_result_threshold() -> f64 {
+    85.0
+}
+
+impl Default for KpiConfig {
+    fn default() -> Self {
+        Self {
+            profile: default_profile(),
+            result_threshold_percent: default_result_threshold(),
+            plans: BTreeMap::new(),
+        }
+    }
+}
+
+impl KpiConfig {
+    pub fn profile_label(&self) -> &'static str {
+        match self.profile.as_str() {
+            "mentor_senior" => "Наставничество и Senior",
+            _ => "Наставничество и Senior",
+        }
+    }
+
+    pub fn max_payout_rub(&self) -> u32 {
+        KPI_KINDS.iter().map(|kind| kind.payout_rub()).sum()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.profile == "mentor_senior",
+            "v0.5 поддерживает профиль mentor_senior (Наставничество и Senior)"
+        );
+        anyhow::ensure!(
+            (0.0..=100.0).contains(&self.result_threshold_percent),
+            "Порог согласованного результата должен быть от 0 до 100"
+        );
+        for (month, plan) in &self.plans {
+            for task in &plan.tasks {
+                anyhow::ensure!(
+                    task.weight > 0.0,
+                    "Вес задачи {} в {} должен быть > 0",
+                    task.task_id,
+                    month
+                );
+                anyhow::ensure!(
+                    task.kind.supports_task_links(),
+                    "К {:?} нельзя привязывать task ID",
+                    task.kind
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn plan(&self, month: &str) -> PeriodPlan {
+        self.plans.get(month).cloned().unwrap_or_default()
+    }
+
+    pub fn plan_mut(&mut self, month: &str) -> &mut PeriodPlan {
+        self.plans.entry(month.to_string()).or_default()
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bitrix: BitrixConfig::default(),
+            kpi: KpiConfig::default(),
+            openrouter: OpenRouterConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    pub fn path() -> Result<PathBuf> {
+        let root = dirs::config_dir().context("Не удалось определить системную папку конфигов")?;
+        Ok(root.join("bkpi").join("config.toml"))
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        let text = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "Нет конфига {}. Сначала выполни: bkpi init <BITRIX_WEBHOOK_URL>",
+                path.display()
+            )
+        })?;
+        let config: Self = toml::from_str(&text).context("Не удалось разобрать config.toml")?;
+        anyhow::ensure!(
+            !config.bitrix.webhook_url.trim().is_empty(),
+            "Webhook в конфиге пуст"
+        );
+        config.kpi.validate()?;
+        config.openrouter.validate()?;
+        Ok(config)
+    }
+
+    pub fn load_or_default() -> Result<Self> {
+        let path = Self::path()?;
+        if path.exists() {
+            Self::load()
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn set_webhook(&mut self, raw: &str) -> Result<()> {
+        let mut url = Url::parse(raw.trim()).context("Некорректный URL webhook")?;
+        anyhow::ensure!(
+            url.scheme() == "https" || url.scheme() == "http",
+            "Webhook должен быть http/https URL"
+        );
+        anyhow::ensure!(url.host_str().is_some(), "В webhook отсутствует host");
+
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        self.bitrix.webhook_url = url.to_string();
+        Ok(())
+    }
+
+    pub fn set_openrouter_key(&mut self, key: &str) -> Result<()> {
+        let key = key.trim();
+        anyhow::ensure!(!key.is_empty(), "OpenRouter API key пуст");
+        anyhow::ensure!(
+            key.starts_with("sk-or-") || key.starts_with("sk-"),
+            "Ключ выглядит необычно. Ожидался OpenRouter API key (обычно sk-or-...)"
+        );
+        self.openrouter.api_key = key.to_string();
+        Ok(())
+    }
+
+    pub fn set_openrouter_model(&mut self, model: &str) -> Result<()> {
+        let model = model.trim();
+        anyhow::ensure!(!model.is_empty(), "OpenRouter model пуст");
+        self.openrouter.model = model.to_string();
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.kpi.validate()?;
+        self.openrouter.validate()?;
+        let path = Self::path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Не удалось создать {}", parent.display()))?;
+        }
+
+        let text = toml::to_string_pretty(self).context("Не удалось сериализовать config.toml")?;
+        fs::write(&path, text).with_context(|| format!("Не удалось записать {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Не удалось выставить права 0600 на {}", path.display()))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn redacted_webhook(&self) -> String {
+        let Ok(mut url) = Url::parse(&self.bitrix.webhook_url) else {
+            return "<invalid>".into();
+        };
+        let segments: Vec<_> = url
+            .path_segments()
+            .map(|s| s.map(str::to_owned).collect())
+            .unwrap_or_default();
+
+        if segments.len() >= 3 {
+            let mut safe = segments;
+            if let Some(secret) = safe.get_mut(2) {
+                *secret = "***".to_string();
+            }
+            url.set_path(&format!("/{}/", safe.join("/")));
+        }
+        url.to_string()
+    }
+
+    pub fn redacted_openrouter_key(&self) -> String {
+        let key = self.openrouter.api_key.trim();
+        if key.is_empty() {
+            return "<not configured>".into();
+        }
+        if key.len() <= 12 {
+            return "***".into();
+        }
+        format!("{}…{}", &key[..8], &key[key.len() - 4..])
+    }
+}
