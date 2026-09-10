@@ -11,7 +11,7 @@ BKPI не зашивает в код конкретные KPI, грейды ил
 Требуется Node.js 22+. Rust конечному пользователю не нужен.
 
 ```sh
-npx bkpi
+npx @eduard-shubin/bkpi
 ```
 
 Installer:
@@ -33,11 +33,13 @@ Installer:
 Полезные команды installer:
 
 ```sh
-npx bkpi doctor
-npx bkpi targets
-npx bkpi@latest update
-npx bkpi uninstall
+npx @eduard-shubin/bkpi doctor
+npx @eduard-shubin/bkpi targets
+npx @eduard-shubin/bkpi@latest update
+npx @eduard-shubin/bkpi uninstall
 ```
+
+После установки native runtime доступен как обычная команда `bkpi`.
 
 ## Создание workspace
 
@@ -187,7 +189,7 @@ bkpi --workspace /absolute/path/to/project mcp
 Targets можно настроить в installer:
 
 ```sh
-npx bkpi targets
+npx @eduard-shubin/bkpi targets
 ```
 
 Installer использует официальные CLI для регистрации MCP и устанавливает общий BKPI skill.
